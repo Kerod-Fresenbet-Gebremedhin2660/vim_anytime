@@ -21,7 +21,7 @@ final class StatusLineView: NSView {
 
     private func configure() {
         wantsLayer = true
-        layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        layer?.backgroundColor = NSColor.clear.cgColor
 
         modeLabel.font = .monospacedSystemFont(ofSize: 11, weight: .bold)
         modeLabel.alignment = .center
@@ -87,4 +87,3 @@ final class StatusLineView: NSView {
         messageLabel.textColor = isError ? .systemRed : .secondaryLabelColor
     }
 }
-

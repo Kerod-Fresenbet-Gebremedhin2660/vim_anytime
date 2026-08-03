@@ -6,6 +6,15 @@ private final class EditorPanel: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
+private enum PanelLayout {
+    static let initialSize = NSSize(width: 680, height: 350)
+    static let backgroundOpacity: CGFloat = 0.88
+    static let widthFraction: CGFloat = 0.52
+    static let heightFraction: CGFloat = 0.40
+    static let minimumSize = NSSize(width: 520, height: 280)
+    static let maximumSize = NSSize(width: 740, height: 410)
+}
+
 @MainActor
 final class EditorPanelController: NSWindowController {
     private let logger = DiagnosticLogger.shared
@@ -13,6 +22,7 @@ final class EditorPanelController: NSWindowController {
     private let commitCoordinator: FieldCommitCoordinator
     private let textView: VimTextView
     private let statusLine = StatusLineView(frame: .zero)
+    private var lineNumberRuler: LineNumberRulerView?
     private var isPresenting = false
     private var lastLoggedMode: VimMode?
 
@@ -21,7 +31,7 @@ final class EditorPanelController: NSWindowController {
         self.commitCoordinator = commitCoordinator
 
         let panel = EditorPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 820, height: 470),
+            contentRect: NSRect(origin: .zero, size: PanelLayout.initialSize),
             styleMask: [.borderless],
             backing: .buffered,
             defer: false
@@ -41,7 +51,11 @@ final class EditorPanelController: NSWindowController {
         super.init(window: panel)
         buildContent(in: panel)
         connectEvents()
-        logger.info("Panel", "initialized textStorageAvailable=\(textView.textStorage != nil)")
+        logger.info(
+            "Panel",
+            "initialized textStorageAvailable=\(textView.textStorage != nil) "
+                + "lineNumbers=true backgroundOpacity=\(PanelLayout.backgroundOpacity)"
+        )
     }
 
     required init?(coder: NSCoder) {
@@ -92,15 +106,19 @@ final class EditorPanelController: NSWindowController {
     }
 
     private func buildContent(in panel: NSPanel) {
-        let background = NSVisualEffectView(frame: panel.contentView?.bounds ?? .zero)
+        let content = NSView(frame: panel.contentView?.bounds ?? .zero)
+        content.wantsLayer = true
+        content.layer?.cornerRadius = 11
+        content.layer?.masksToBounds = true
+        panel.contentView = content
+
+        let background = NSVisualEffectView(frame: .zero)
         background.material = .popover
         background.blendingMode = .behindWindow
         background.state = .active
-        background.wantsLayer = true
-        background.layer?.cornerRadius = 11
-        background.layer?.masksToBounds = true
+        background.alphaValue = PanelLayout.backgroundOpacity
         background.translatesAutoresizingMaskIntoConstraints = false
-        panel.contentView = background
+        content.addSubview(background)
 
         let scrollView = NSScrollView(frame: .zero)
         scrollView.translatesAutoresizingMaskIntoConstraints = false
@@ -109,6 +127,7 @@ final class EditorPanelController: NSWindowController {
         scrollView.autohidesScrollers = true
         scrollView.borderType = .noBorder
         scrollView.drawsBackground = false
+        scrollView.contentView.drawsBackground = false
         textView.frame = scrollView.contentView.bounds
         textView.autoresizingMask = [.width]
         textView.minSize = NSSize(width: 0, height: scrollView.contentSize.height)
@@ -119,18 +138,27 @@ final class EditorPanelController: NSWindowController {
         textView.isVerticallyResizable = true
         textView.isHorizontallyResizable = false
         scrollView.documentView = textView
+        let lineNumberRuler = LineNumberRulerView(textView: textView, scrollView: scrollView)
+        self.lineNumberRuler = lineNumberRuler
+        scrollView.verticalRulerView = lineNumberRuler
+        scrollView.hasVerticalRuler = true
+        scrollView.rulersVisible = true
 
         statusLine.translatesAutoresizingMaskIntoConstraints = false
-        background.addSubview(scrollView)
-        background.addSubview(statusLine)
+        content.addSubview(scrollView)
+        content.addSubview(statusLine)
         NSLayoutConstraint.activate([
-            scrollView.leadingAnchor.constraint(equalTo: background.leadingAnchor),
-            scrollView.trailingAnchor.constraint(equalTo: background.trailingAnchor),
-            scrollView.topAnchor.constraint(equalTo: background.topAnchor),
+            background.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            background.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            background.topAnchor.constraint(equalTo: content.topAnchor),
+            background.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            scrollView.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            scrollView.topAnchor.constraint(equalTo: content.topAnchor),
             scrollView.bottomAnchor.constraint(equalTo: statusLine.topAnchor),
-            statusLine.leadingAnchor.constraint(equalTo: background.leadingAnchor),
-            statusLine.trailingAnchor.constraint(equalTo: background.trailingAnchor),
-            statusLine.bottomAnchor.constraint(equalTo: background.bottomAnchor),
+            statusLine.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            statusLine.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            statusLine.bottomAnchor.constraint(equalTo: content.bottomAnchor),
             statusLine.heightAnchor.constraint(equalToConstant: 28),
         ])
     }
@@ -165,7 +193,12 @@ final class EditorPanelController: NSWindowController {
                         + "isError=\(message.hasPrefix("E"))"
                 )
             }
-            self.textView.apply(snapshot: snapshot)
+            if let textChanged = self.textView.apply(snapshot: snapshot) {
+                self.lineNumberRuler?.update(
+                    text: textChanged ? snapshot.text : nil,
+                    currentLine: snapshot.cursor.line
+                )
+            }
             self.statusLine.render(snapshot)
         }
         viewModel.onApplicationCommand = { [weak self] command in
@@ -237,8 +270,14 @@ final class EditorPanelController: NSWindowController {
             panel.center()
             return
         }
-        let width = min(900, max(620, visibleFrame.width * 0.68))
-        let height = min(560, max(360, visibleFrame.height * 0.54))
+        let width = min(
+            PanelLayout.maximumSize.width,
+            max(PanelLayout.minimumSize.width, visibleFrame.width * PanelLayout.widthFraction)
+        )
+        let height = min(
+            PanelLayout.maximumSize.height,
+            max(PanelLayout.minimumSize.height, visibleFrame.height * PanelLayout.heightFraction)
+        )
         panel.setContentSize(NSSize(width: width, height: height))
         panel.setFrameOrigin(NSPoint(
             x: visibleFrame.midX - width / 2,

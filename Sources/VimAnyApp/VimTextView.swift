@@ -45,8 +45,8 @@ final class VimTextView: NSTextView, NSTextViewDelegate {
         isAutomaticSpellingCorrectionEnabled = false
         isContinuousSpellCheckingEnabled = false
         usesFindPanel = false
-        drawsBackground = true
-        backgroundColor = .textBackgroundColor
+        drawsBackground = false
+        backgroundColor = .clear
         textColor = .textColor
         insertionPointColor = .controlAccentColor
         font = NSFont.monospacedSystemFont(ofSize: 15, weight: .regular)
@@ -181,11 +181,12 @@ final class VimTextView: NSTextView, NSTextViewDelegate {
         }
     }
 
-    func apply(snapshot: EditorSnapshot) {
+    @discardableResult
+    func apply(snapshot: EditorSnapshot) -> Bool? {
         guard !hasMarkedText() else {
             logger.debug("TextView", "snapshot deferred during marked-text composition")
             deferredSnapshot = snapshot
-            return
+            return nil
         }
 
         isApplyingSnapshot = true
@@ -200,7 +201,7 @@ final class VimTextView: NSTextView, NSTextViewDelegate {
             ]
             guard let textStorage else {
                 logger.error("TextView", "cannot render snapshot because NSTextStorage is missing")
-                return
+                return nil
             }
             textStorage.setAttributedString(NSAttributedString(string: snapshot.text, attributes: attributes))
         }
@@ -232,6 +233,7 @@ final class VimTextView: NSTextView, NSTextViewDelegate {
                 + "utf16Length=\(count) selection=\(NSStringFromRange(range)) "
                 + "cursorOffset=\(cursorUTF16Offset) frame=\(NSStringFromRect(frame))"
         )
+        return textChanged
     }
 
     private func blockCursorRect() -> NSRect? {
