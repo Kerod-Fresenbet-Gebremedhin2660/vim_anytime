@@ -17,6 +17,11 @@ public indirect enum MessagePackValue: Equatable, Sendable {
         return value
     }
 
+    public var boolValue: Bool? {
+        guard case .bool(let value) = self else { return nil }
+        return value
+    }
+
     public var intValue: Int64? {
         switch self {
         case .int(let value): return value

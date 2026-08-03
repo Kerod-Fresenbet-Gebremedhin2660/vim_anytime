@@ -34,6 +34,7 @@ public actor NvimHost: NvimEditingEngine {
     private var standardErrorPipe: Pipe?
     private var stopping = false
     private var recoverySnapshot: EditorSnapshot?
+    private var pendingInputTokens: [String] = []
 
     public init(
         clipboard: SystemClipboardService,
@@ -61,6 +62,7 @@ public actor NvimHost: NvimEditingEngine {
             "buffer load utf16Length=\(text.utf16.count) utf8Length=\(text.utf8.count) "
                 + "selection=\(Self.describe(selection))"
         )
+        pendingInputTokens.removeAll()
         try await withRestart {
             try await self.loadInternal(text: text, selection: selection, desiredMode: .normal)
         }
@@ -70,7 +72,7 @@ public actor NvimHost: NvimEditingEngine {
     public func sendKey(_ key: VimKey) async throws {
         logger.debug("Neovim", "key input \(Self.describe(key))")
         try await withRestart {
-            try await self.inputNotation(key.notation)
+            try await self.inputNotation(key.notation, tracksPendingInput: true)
         }
     }
 
@@ -90,6 +92,19 @@ public actor NvimHost: NvimEditingEngine {
     }
 
     public func snapshot() async throws -> EditorSnapshot {
+        let modeState = try await withRestart {
+            try await self.currentModeState()
+        }
+        if shouldReturnPendingSnapshot(for: modeState) {
+            let snapshot = makePendingSnapshot(modeState: modeState)
+            logger.debug(
+                "Neovim",
+                "pending snapshot mode=\(snapshot.mode.displayName) "
+                    + "tokenCount=\(pendingInputTokens.count) blocking=\(modeState.isBlocking)"
+            )
+            return snapshot
+        }
+
         let result = try await withRestart {
             try await self.rawRequest("nvim_exec_lua", [
                 .string(Self.snapshotLua),
@@ -97,6 +112,7 @@ public actor NvimHost: NvimEditingEngine {
             ])
         }
         let snapshot = try decodeSnapshot(result)
+        pendingInputTokens.removeAll()
         recoverySnapshot = snapshot
         logger.debug(
             "Neovim",
@@ -137,6 +153,7 @@ public actor NvimHost: NvimEditingEngine {
 
     public func reset() async throws {
         logger.info("Neovim", "buffer reset requested")
+        pendingInputTokens.removeAll()
         try await withRestart {
             try await self.loadInternal(
                 text: "",
@@ -145,6 +162,7 @@ public actor NvimHost: NvimEditingEngine {
             )
         }
         recoverySnapshot = nil
+        pendingInputTokens.removeAll()
         logger.info("Neovim", "buffer reset completed")
     }
 
@@ -159,6 +177,7 @@ public actor NvimHost: NvimEditingEngine {
         standardOutputPipe = nil
         standardErrorPipe?.fileHandleForReading.readabilityHandler = nil
         standardErrorPipe = nil
+        pendingInputTokens.removeAll()
         oldClient?.close(reason: "VimAny is stopping")
         oldProcess?.terminationHandler = nil
         if oldProcess?.isRunning == true {
@@ -337,6 +356,7 @@ public actor NvimHost: NvimEditingEngine {
         standardOutputPipe = nil
         standardErrorPipe?.fileHandleForReading.readabilityHandler = nil
         standardErrorPipe = nil
+        pendingInputTokens.removeAll()
         oldClient?.close(reason: "Restarting Neovim")
         oldProcess?.terminationHandler = nil
         if oldProcess?.isRunning == true { oldProcess?.terminate() }
@@ -387,16 +407,16 @@ public actor NvimHost: NvimEditingEngine {
 
         switch desiredMode {
         case .insert:
-            try await inputNotation("i")
+            try await inputNotation("i", tracksPendingInput: false)
         case .replace:
-            try await inputNotation("R")
+            try await inputNotation("R", tracksPendingInput: false)
         default:
             break
         }
     }
 
     private func applySelection(_ selection: EditorSelection) async throws {
-        try await inputNotation("<Esc><Esc>")
+        try await inputNotation("<Esc><Esc>", tracksPendingInput: false)
         _ = try await rawRequest("nvim_win_set_cursor", [
             .int(0),
             .array([.int(Int64(selection.anchor.line + 1)), .int(Int64(selection.anchor.utf8Column))]),
@@ -406,13 +426,13 @@ public actor NvimHost: NvimEditingEngine {
         case .caret:
             break
         case .character:
-            try await inputNotation("v")
+            try await inputNotation("v", tracksPendingInput: false)
             _ = try await rawRequest("nvim_win_set_cursor", [
                 .int(0),
                 .array([.int(Int64(selection.head.line + 1)), .int(Int64(selection.head.utf8Column))]),
             ])
         case .line:
-            try await inputNotation("V")
+            try await inputNotation("V", tracksPendingInput: false)
             _ = try await rawRequest("nvim_win_set_cursor", [
                 .int(0),
                 .array([.int(Int64(selection.head.line + 1)), .int(Int64(selection.head.utf8Column))]),
@@ -420,12 +440,72 @@ public actor NvimHost: NvimEditingEngine {
         }
     }
 
-    private func inputNotation(_ notation: String) async throws {
+    private func inputNotation(
+        _ notation: String,
+        tracksPendingInput: Bool = false
+    ) async throws {
         // nvim_input translates key notation such as <BS> and <Left> itself.
         // Pre-expanding with nvim_replace_termcodes would return Neovim's
         // internal K_SPECIAL bytes over RPC, which are not valid UTF-8.
         _ = try await rawRequest("nvim_input", [.string(notation)])
-        _ = try await rawRequest("nvim_eval", [.string("0")])
+        if tracksPendingInput {
+            pendingInputTokens.append(contentsOf: Self.tokenize(notation))
+        }
+    }
+
+    private struct ModeState {
+        let rawMode: String
+        let isBlocking: Bool
+    }
+
+    private func currentModeState() async throws -> ModeState {
+        let value = try await rawRequest("nvim_get_mode")
+        guard let rawMode = value["mode"]?.stringValue,
+              let isBlocking = value["blocking"]?.boolValue else {
+            throw NvimHostError.invalidResponse(method: "nvim_get_mode")
+        }
+        return ModeState(rawMode: rawMode, isBlocking: isBlocking)
+    }
+
+    private func shouldReturnPendingSnapshot(for modeState: ModeState) -> Bool {
+        guard !pendingInputTokens.isEmpty else { return false }
+        let mode = Self.mode(from: modeState.rawMode)
+        if mode == .operatorPending || mode == .commandLine { return true }
+        return Self.isSyntacticallyIncomplete(
+            pendingInputTokens,
+            startingIn: recoverySnapshot?.mode ?? .normal
+        )
+    }
+
+    private func makePendingSnapshot(modeState: ModeState) -> EditorSnapshot {
+        let fallbackPosition = TextPosition(line: 0, utf8Column: 0)
+        let base = recoverySnapshot ?? EditorSnapshot(
+            text: "",
+            cursor: fallbackPosition,
+            selection: nil,
+            mode: .normal
+        )
+        let rawMode = Self.mode(from: modeState.rawMode)
+        let operatorName = Self.pendingOperator(in: pendingInputTokens)
+        let mode: VimMode
+        if rawMode == .operatorPending || operatorName != nil {
+            mode = .operatorPending
+        } else if rawMode == .commandLine || Self.commandLineStart(in: pendingInputTokens) != nil {
+            mode = .commandLine
+        } else {
+            mode = rawMode
+        }
+
+        return EditorSnapshot(
+            text: base.text,
+            cursor: base.cursor,
+            selection: base.selection,
+            mode: mode,
+            message: nil,
+            pendingOperator: operatorName,
+            pendingCount: Self.pendingCount(in: pendingInputTokens),
+            command: Self.pendingCommandLine(in: pendingInputTokens)
+        )
     }
 
     private func decodeSnapshot(_ value: MessagePackValue) throws -> EditorSnapshot {
@@ -463,8 +543,12 @@ public actor NvimHost: NvimEditingEngine {
         let message = [errorMessage, infoMessage]
             .compactMap { item in item.flatMap { $0.isEmpty ? nil : $0 } }
             .first
-        let pendingOperator = value["operator"]?.stringValue.flatMap { $0.isEmpty ? nil : $0 }
-        let count = value["count"]?.intValue.flatMap { $0 > 0 ? Int($0) : nil }
+        let pendingOperator = mode == .operatorPending
+            ? value["operator"]?.stringValue.flatMap { $0.isEmpty ? nil : $0 }
+            : nil
+        let count = mode == .operatorPending
+            ? value["count"]?.intValue.flatMap { $0 > 0 ? Int($0) : nil }
+            : nil
         let command = value["command"]?.stringValue.flatMap { $0.isEmpty ? nil : $0 }
 
         return EditorSnapshot(
@@ -515,6 +599,147 @@ public actor NvimHost: NvimEditingEngine {
             registerType: registerType
         )
     }
+
+    private static func tokenize(_ notation: String) -> [String] {
+        var tokens: [String] = []
+        var index = notation.startIndex
+        while index < notation.endIndex {
+            if notation[index] == "<",
+               let closing = notation[index...].firstIndex(of: ">") {
+                tokens.append(String(notation[index...closing]))
+                index = notation.index(after: closing)
+            } else {
+                let next = notation.index(after: index)
+                tokens.append(String(notation[index..<next]))
+                index = next
+            }
+        }
+        return tokens
+    }
+
+    private static func isSyntacticallyIncomplete(
+        _ tokens: [String],
+        startingIn mode: VimMode
+    ) -> Bool {
+        guard !tokens.isEmpty else { return false }
+        if commandLineStart(in: tokens) != nil {
+            return !isCommandLineTerminator(tokens.last)
+        }
+        if isCommandLineTerminator(tokens.last) { return false }
+
+        var index = 0
+        let hasLeadingCount = consumeCount(in: tokens, index: &index)
+        if index == tokens.count { return hasLeadingCount }
+
+        let token = tokens[index]
+        if mode == .normal || mode == .operatorPending {
+            if normalOperators.contains(token) {
+                index += 1
+                _ = consumeCount(in: tokens, index: &index)
+                if index == tokens.count { return true }
+
+                let motion = tokens[index]
+                if textObjectPrefixes.contains(motion)
+                    || motionPrefixes.contains(motion)
+                    || characterArgumentCommands.contains(motion) {
+                    return index + 1 == tokens.count
+                }
+                return false
+            }
+        }
+
+        if motionPrefixes.contains(token) || characterArgumentCommands.contains(token) {
+            return index + 1 == tokens.count
+        }
+        return false
+    }
+
+    @discardableResult
+    private static func consumeCount(in tokens: [String], index: inout Int) -> Bool {
+        guard index < tokens.count,
+              tokens[index].count == 1,
+              let first = tokens[index].first,
+              first >= "1", first <= "9" else { return false }
+        index += 1
+        while index < tokens.count,
+              tokens[index].count == 1,
+              let digit = tokens[index].first,
+              digit >= "0", digit <= "9" {
+            index += 1
+        }
+        return true
+    }
+
+    private static func pendingOperator(in tokens: [String]) -> String? {
+        var index = 0
+        _ = consumeCount(in: tokens, index: &index)
+        guard index < tokens.count else { return nil }
+        if normalOperators.contains(tokens[index]) { return tokens[index] }
+        if index + 1 < tokens.count,
+           tokens[index] == "g",
+           ["U", "u", "~"].contains(tokens[index + 1]) {
+            return tokens[index] + tokens[index + 1]
+        }
+        return nil
+    }
+
+    private static func pendingCount(in tokens: [String]) -> Int? {
+        var index = 0
+        let leading = consumeCountValue(in: tokens, index: &index)
+        var operatorCount: Int?
+        if index < tokens.count, normalOperators.contains(tokens[index]) {
+            index += 1
+            operatorCount = consumeCountValue(in: tokens, index: &index)
+        }
+        switch (leading, operatorCount) {
+        case (nil, nil): return nil
+        case (let value?, nil), (nil, let value?): return value
+        case (let first?, let second?):
+            let result = first.multipliedReportingOverflow(by: second)
+            return result.overflow ? Int.max : result.partialValue
+        }
+    }
+
+    private static func consumeCountValue(in tokens: [String], index: inout Int) -> Int? {
+        let start = index
+        guard consumeCount(in: tokens, index: &index) else { return nil }
+        return Int(tokens[start..<index].joined())
+    }
+
+    private static func commandLineStart(in tokens: [String]) -> Int? {
+        var index = 0
+        _ = consumeCount(in: tokens, index: &index)
+        if index < tokens.count, normalOperators.contains(tokens[index]) {
+            index += 1
+            _ = consumeCount(in: tokens, index: &index)
+        }
+        guard index < tokens.count,
+              tokens[index] == "/" || tokens[index] == "?" else { return nil }
+        return index
+    }
+
+    private static func pendingCommandLine(in tokens: [String]) -> String? {
+        guard let start = commandLineStart(in: tokens),
+              !isCommandLineTerminator(tokens.last) else { return nil }
+        var command = tokens[start]
+        for token in tokens.dropFirst(start + 1) {
+            if token == "<BS>" || token == "<Del>" {
+                if command.count > 1 { command.removeLast() }
+            } else if token.count == 1 {
+                command.append(token)
+            }
+        }
+        return command
+    }
+
+    private static func isCommandLineTerminator(_ token: String?) -> Bool {
+        token == "<CR>" || token == "<Esc>" || token == "<C-c>"
+    }
+
+    private static let normalOperators: Set<String> = ["d", "c", "y", ">", "<", "="]
+    private static let textObjectPrefixes: Set<String> = ["i", "a"]
+    private static let motionPrefixes: Set<String> = ["g", "z", "[", "]", "<C-w>"]
+    private static let characterArgumentCommands: Set<String> = ["f", "F", "t", "T", "r"]
 
     private static func mode(from rawMode: String) -> VimMode {
         if rawMode == "v" || rawMode == "\u{16}" || rawMode.hasPrefix("vs") { return .visual }

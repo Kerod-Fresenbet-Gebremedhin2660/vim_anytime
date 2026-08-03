@@ -255,8 +255,11 @@ public final class MessagePackRPCClient: @unchecked Sendable {
     }
 
     private func timeOut(messageID: Int64, method: String) {
+        let request = stateLock.withLock { pending.removeValue(forKey: messageID) }
+        guard let request else { return }
+        let error = MessagePackRPCError.timedOut(method: method)
         logger.error("RPC", "request timed out id=\(messageID) method=\(method)")
-        failPending(messageID: messageID, error: MessagePackRPCError.timedOut(method: method))
+        request.continuation.resume(throwing: error)
     }
 
     private func failPending(messageID: Int64, error: Error) {

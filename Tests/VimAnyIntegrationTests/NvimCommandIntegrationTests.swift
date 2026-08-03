@@ -166,6 +166,121 @@ final class NvimCommandIntegrationTests: XCTestCase {
         }
     }
 
+    func testCountedCommandsAcrossIndividualKeyEvents() async throws {
+        try await withHost { host, _ in
+            try await host.load(
+                text: "one two three four",
+                selection: .caret(at: TextPosition(line: 0, utf8Column: 0))
+            )
+
+            try await host.sendKey(VimKey("2"))
+            var snapshot = try await host.snapshot()
+            XCTAssertEqual(snapshot.text, "one two three four")
+            XCTAssertEqual(snapshot.cursor, TextPosition(line: 0, utf8Column: 0))
+            XCTAssertEqual(snapshot.mode, .normal)
+            XCTAssertEqual(snapshot.pendingCount, 2)
+
+            try await host.sendKey(VimKey("w"))
+            snapshot = try await host.snapshot()
+            XCTAssertEqual(snapshot.cursor, TextPosition(line: 0, utf8Column: 8))
+            XCTAssertNil(snapshot.pendingCount)
+
+            try await host.load(
+                text: "one two three four five six seven",
+                selection: .caret(at: TextPosition(line: 0, utf8Column: 0))
+            )
+            let keys = ["2", "d", "3", "w"]
+            for key in keys {
+                try await host.sendKey(VimKey(key))
+                snapshot = try await host.snapshot()
+            }
+            XCTAssertEqual(snapshot.text, "seven")
+            XCTAssertEqual(snapshot.mode, .normal)
+            XCTAssertNil(snapshot.pendingOperator)
+            XCTAssertNil(snapshot.pendingCount)
+        }
+    }
+
+    func testOperatorTextObjectAndPrefixesAcrossIndividualKeyEvents() async throws {
+        try await withHost { host, _ in
+            try await host.load(
+                text: "one two three",
+                selection: .caret(at: TextPosition(line: 0, utf8Column: 1))
+            )
+
+            try await host.sendKey(VimKey("c"))
+            var snapshot = try await host.snapshot()
+            XCTAssertEqual(snapshot.mode, .operatorPending)
+            XCTAssertEqual(snapshot.pendingOperator, "c")
+
+            try await host.sendKey(VimKey("i"))
+            snapshot = try await host.snapshot()
+            XCTAssertEqual(snapshot.mode, .operatorPending)
+
+            try await host.sendKey(VimKey("w"))
+            snapshot = try await host.snapshot()
+            XCTAssertEqual(snapshot.mode, .insert)
+            try await host.insertText("X")
+            try await host.sendKey(VimKey("<Esc>"))
+            snapshot = try await host.snapshot()
+            XCTAssertEqual(snapshot.text, "X two three")
+
+            try await host.load(
+                text: "one two three",
+                selection: .caret(at: TextPosition(line: 0, utf8Column: 8))
+            )
+            try await host.sendKey(VimKey("g"))
+            snapshot = try await host.snapshot()
+            XCTAssertEqual(snapshot.cursor.utf8Column, 8)
+            try await host.sendKey(VimKey("e"))
+            snapshot = try await host.snapshot()
+            XCTAssertEqual(snapshot.cursor.utf8Column, 6)
+
+            try await host.load(
+                text: "one\ntwo",
+                selection: .caret(at: TextPosition(line: 1, utf8Column: 0))
+            )
+            try await host.sendKey(VimKey("g"))
+            _ = try await host.snapshot()
+            try await host.sendKey(VimKey("g"))
+            snapshot = try await host.snapshot()
+            XCTAssertEqual(snapshot.cursor.line, 0)
+
+            try await host.load(
+                text: "abc/def",
+                selection: .caret(at: TextPosition(line: 0, utf8Column: 0))
+            )
+            try await host.sendKey(VimKey("f"))
+            _ = try await host.snapshot()
+            try await host.sendKey(VimKey("/"))
+            snapshot = try await host.snapshot()
+            XCTAssertEqual(snapshot.mode, .normal)
+            XCTAssertEqual(snapshot.cursor.utf8Column, 3)
+        }
+    }
+
+    func testSearchAcrossIndividualKeyEvents() async throws {
+        try await withHost { host, _ in
+            try await host.load(
+                text: "hay needle hay needle",
+                selection: .caret(at: TextPosition(line: 0, utf8Column: 0))
+            )
+
+            var snapshot: EditorSnapshot?
+            for key in ["/", "n", "e", "e", "d", "l", "e"] {
+                try await host.sendKey(VimKey(key))
+                snapshot = try await host.snapshot()
+                XCTAssertEqual(snapshot?.mode, .commandLine)
+            }
+            XCTAssertEqual(snapshot?.command, "/needle")
+
+            try await host.sendKey(VimKey("<CR>"))
+            snapshot = try await host.snapshot()
+            XCTAssertEqual(snapshot?.mode, .normal)
+            XCTAssertEqual(snapshot?.cursor.utf8Column, 4)
+        }
+    }
+
     func testUnexpectedNeovimExitRestartsAndRecoversLatestSnapshot() async throws {
         try await withHost { host, _ in
             try await host.load(
