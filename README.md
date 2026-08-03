@@ -10,7 +10,7 @@ Requirements:
 
 - macOS 13 or newer
 - Xcode 15 or newer
-- Neovim 0.10 or newer (`nvim` in `PATH`, `~/.local/bin`, `/opt/homebrew/bin`, or `/usr/local/bin`)
+- Neovim 0.10 or newer for local development builds and tests (`nvim` in `PATH`, `~/.local/bin`, `/opt/homebrew/bin`, or `/usr/local/bin`)
 
 Open `Package.swift` in Xcode to develop and run tests, or build an application bundle from Terminal:
 
@@ -38,6 +38,33 @@ defaults write dev.vimany.VimAny GlobalShortcutModifiers -int 4096
 ```
 
 Restart VimAny after changing those values.
+
+## Build a DMG
+
+Create a universal Apple Silicon and Intel installer image with:
+
+```sh
+./Scripts/build-dmg.sh
+```
+
+The DMG and its SHA-256 checksum are written to `.build/distribution/`. It
+contains `VimAny.app`, an Applications shortcut, and personal-install notes.
+The app includes pinned Neovim 0.10.4 distributions for both Apple Silicon and
+Intel, so the destination Mac does not need Homebrew, Neovim, or another
+third-party dependency. The build downloads the official release archives,
+verifies their fixed SHA-256 checksums, and includes the Neovim license and
+source metadata in the application bundle.
+
+Without a signing identity, the script creates an ad-hoc-signed personal build.
+For Developer ID signing, set `VIMANY_CODESIGN_IDENTITY`. To submit that signed
+image for notarization as well, store credentials in a `notarytool` keychain
+profile and set `VIMANY_NOTARY_PROFILE`:
+
+```sh
+VIMANY_CODESIGN_IDENTITY="Developer ID Application: Example (TEAMID)" \
+VIMANY_NOTARY_PROFILE="vimany-notary" \
+./Scripts/build-dmg.sh
+```
 
 ## Diagnostics
 

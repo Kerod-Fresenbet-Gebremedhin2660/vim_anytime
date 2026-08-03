@@ -1,0 +1,14 @@
+Bundled dependency: Neovim 0.10.4
+Source: https://github.com/neovim/neovim/releases/tag/v0.10.4
+
+Official release archives bundled by Scripts/prepare-bundled-neovim.sh:
+
+  nvim-macos-arm64.tar.gz
+  SHA-256: 3d7b07ec9b491d2a3d55167bc1db1cfa96773a1a37e74ea384cb15ab0189223b
+
+  nvim-macos-x86_64.tar.gz
+  SHA-256: c1405071127b59dbdefc31d9c52e9a5c36db67dcef6dcf83e898aada1f3f778e
+
+The archives and Neovim license are downloaded from the official Neovim
+release and source repositories. Their checksums are verified before they are
+copied into VimAny.app.

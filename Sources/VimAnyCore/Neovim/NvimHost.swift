@@ -10,7 +10,7 @@ public enum NvimHostError: Error, LocalizedError, Sendable {
     public var errorDescription: String? {
         switch self {
         case .executableNotFound:
-            return "Neovim was not found. Install nvim or set VIMANY_NVIM_PATH to its executable."
+            return "The bundled Neovim engine was not found. Reinstall VimAny, or set VIMANY_NVIM_PATH for development."
         case .launchFailed(let message):
             return "Neovim could not be launched: \(message)"
         case .configurationFailed(let stage, let message):
@@ -237,6 +237,10 @@ public actor NvimHost: NvimEditingEngine {
         process.standardError = errorPipe
         var environment = ProcessInfo.processInfo.environment
         environment["NVIM_APPNAME"] = "vimany-embedded"
+        if let bundledRuntime = Self.bundledNvimRuntime(for: url) {
+            environment["VIMRUNTIME"] = bundledRuntime.path
+            logger.info("Neovim", "using bundled runtime=\(bundledRuntime.path)")
+        }
         process.environment = environment
 
         let client = MessagePackRPCClient(
@@ -754,10 +758,17 @@ public actor NvimHost: NvimEditingEngine {
 
     private static func locateNvimExecutable() -> URL? {
         let environment = ProcessInfo.processInfo.environment
-        var candidates: [String] = []
         if let configured = environment["VIMANY_NVIM_PATH"], !configured.isEmpty {
-            candidates.append(configured)
+            if FileManager.default.isExecutableFile(atPath: configured) {
+                return URL(fileURLWithPath: configured)
+            }
         }
+
+        if let bundledExecutable = bundledNvimExecutable() {
+            return bundledExecutable
+        }
+
+        var candidates: [String] = []
         if let path = environment["PATH"] {
             candidates += path.split(separator: ":").map { "\($0)/nvim" }
         }
@@ -775,6 +786,49 @@ public actor NvimHost: NvimEditingEngine {
             }
         }
         return nil
+    }
+
+    private static func bundledNvimExecutable() -> URL? {
+        guard let root = bundledNvimRoot() else { return nil }
+        let executable = root.appendingPathComponent("bin/nvim")
+        let runtime = root.appendingPathComponent("share/nvim/runtime", isDirectory: true)
+        guard FileManager.default.isExecutableFile(atPath: executable.path),
+              FileManager.default.fileExists(atPath: runtime.path) else {
+            return nil
+        }
+        return executable
+    }
+
+    private static func bundledNvimRuntime(for executable: URL) -> URL? {
+        guard let root = bundledNvimRoot() else { return nil }
+        let expectedExecutable = root.appendingPathComponent("bin/nvim")
+        guard executable.standardizedFileURL == expectedExecutable.standardizedFileURL else {
+            return nil
+        }
+
+        let runtime = root.appendingPathComponent("share/nvim/runtime", isDirectory: true)
+        guard FileManager.default.fileExists(atPath: runtime.path) else { return nil }
+        return runtime
+    }
+
+    private static func bundledNvimRoot() -> URL? {
+        guard let resources = Bundle.main.resourceURL,
+              let architecture = bundledArchitecture else {
+            return nil
+        }
+        return resources
+            .appendingPathComponent("neovim", isDirectory: true)
+            .appendingPathComponent(architecture, isDirectory: true)
+    }
+
+    private static var bundledArchitecture: String? {
+        #if arch(arm64)
+        return "arm64"
+        #elseif arch(x86_64)
+        return "x86_64"
+        #else
+        return nil
+        #endif
     }
 
     private static let configurationLua = #"""
