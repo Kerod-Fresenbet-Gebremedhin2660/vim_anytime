@@ -1,0 +1,573 @@
+import Foundation
+
+public enum NvimHostError: Error, LocalizedError, Sendable {
+    case executableNotFound
+    case launchFailed(String)
+    case configurationFailed(stage: String, message: String)
+    case invalidResponse(method: String)
+    case notRunning
+
+    public var errorDescription: String? {
+        switch self {
+        case .executableNotFound:
+            return "Neovim was not found. Install nvim or set VIMANY_NVIM_PATH to its executable."
+        case .launchFailed(let message):
+            return "Neovim could not be launched: \(message)"
+        case .configurationFailed(let stage, let message):
+            return "Neovim configuration failed during \(stage): \(message)"
+        case .invalidResponse(let method):
+            return "Neovim returned an invalid response for \(method)."
+        case .notRunning:
+            return "The embedded Neovim process is not running."
+        }
+    }
+}
+
+public actor NvimHost: NvimEditingEngine {
+    private let clipboard: SystemClipboardService
+    private let executableURL: URL?
+    private var process: Process?
+    private var rpcClient: MessagePackRPCClient?
+    private var standardInputPipe: Pipe?
+    private var standardOutputPipe: Pipe?
+    private var stopping = false
+    private var recoverySnapshot: EditorSnapshot?
+
+    public init(
+        clipboard: SystemClipboardService,
+        executableURL: URL? = nil
+    ) {
+        self.clipboard = clipboard
+        self.executableURL = executableURL
+    }
+
+    public func start() async throws {
+        stopping = false
+        try await ensureRunning(recovering: true)
+    }
+
+    public func load(text: String, selection: EditorSelection) async throws {
+        try await withRestart {
+            try await self.loadInternal(text: text, selection: selection, desiredMode: .normal)
+        }
+        recoverySnapshot = try await snapshot()
+    }
+
+    public func sendKey(_ key: VimKey) async throws {
+        try await withRestart {
+            let encoded = try await self.rawRequest(
+                "nvim_replace_termcodes",
+                [.string(key.notation), .bool(true), .bool(false), .bool(true)]
+            )
+            guard let keys = encoded.stringValue else {
+                throw NvimHostError.invalidResponse(method: "nvim_replace_termcodes")
+            }
+            _ = try await self.rawRequest("nvim_input", [.string(keys)])
+            _ = try await self.rawRequest("nvim_eval", [.string("0")])
+        }
+    }
+
+    public func insertText(_ text: String) async throws {
+        guard !text.isEmpty else { return }
+        try await withRestart {
+            _ = try await self.rawRequest(
+                "nvim_paste",
+                [.string(text), .bool(false), .int(-1)]
+            )
+            _ = try await self.rawRequest("nvim_eval", [.string("0")])
+        }
+    }
+
+    public func snapshot() async throws -> EditorSnapshot {
+        let result = try await withRestart {
+            try await self.rawRequest("nvim_exec_lua", [
+                .string(Self.snapshotLua),
+                .array([]),
+            ])
+        }
+        let snapshot = try decodeSnapshot(result)
+        recoverySnapshot = snapshot
+        return snapshot
+    }
+
+    public func execute(_ command: SafeExCommand) async throws {
+        switch command {
+        case .undo:
+            try await sendKey(VimKey("u"))
+        case .redo:
+            try await sendKey(VimKey("<C-r>"))
+        case .clearSearchHighlight:
+            try await withRestart {
+                _ = try await self.rawRequest("nvim_exec_lua", [
+                    .string("vim.cmd('nohlsearch')"),
+                    .array([]),
+                ])
+            }
+        case .write, .writeAndClose, .cancel:
+            // These commands belong to the native field session, not to the scratch buffer.
+            break
+        }
+    }
+
+    public func setNativeSelection(_ selection: EditorSelection) async throws {
+        try await withRestart {
+            try await self.applySelection(selection)
+        }
+    }
+
+    public func reset() async throws {
+        try await withRestart {
+            try await self.loadInternal(
+                text: "",
+                selection: .caret(at: TextPosition(line: 0, utf8Column: 0)),
+                desiredMode: .normal
+            )
+        }
+        recoverySnapshot = nil
+    }
+
+    public func stop() async {
+        stopping = true
+        let oldClient = rpcClient
+        let oldProcess = process
+        rpcClient = nil
+        process = nil
+        standardInputPipe = nil
+        standardOutputPipe = nil
+        oldClient?.close(reason: "VimAny is stopping")
+        if oldProcess?.isRunning == true {
+            oldProcess?.terminate()
+        }
+    }
+
+    public func isProcessRunning() -> Bool {
+        process?.isRunning == true
+    }
+
+    func terminateEmbeddedProcessForTesting() {
+        process?.terminate()
+    }
+
+    private func ensureRunning(recovering: Bool) async throws {
+        if process?.isRunning == true, rpcClient != nil { return }
+        try launch()
+        try await configure()
+        if recovering, let recoverySnapshot {
+            let selection = recoverySnapshot.selection
+                ?? .caret(at: recoverySnapshot.cursor)
+            try await loadInternal(
+                text: recoverySnapshot.text,
+                selection: selection,
+                desiredMode: recoverySnapshot.mode
+            )
+        }
+    }
+
+    private func launch() throws {
+        let url = executableURL ?? Self.locateNvimExecutable()
+        guard let url else { throw NvimHostError.executableNotFound }
+
+        let process = Process()
+        let inputPipe = Pipe()
+        let outputPipe = Pipe()
+        process.executableURL = url
+        process.arguments = ["--embed", "--headless", "--clean", "-i", "NONE"]
+        process.standardInput = inputPipe
+        process.standardOutput = outputPipe
+        process.standardError = FileHandle.nullDevice
+        var environment = ProcessInfo.processInfo.environment
+        environment["NVIM_APPNAME"] = "vimany-embedded"
+        process.environment = environment
+
+        let client = MessagePackRPCClient(
+            input: outputPipe.fileHandleForReading,
+            output: inputPipe.fileHandleForWriting
+        )
+        installClipboardHandlers(on: client)
+        process.terminationHandler = { [weak client] process in
+            client?.close(reason: "Neovim exited with status \(process.terminationStatus)")
+        }
+
+        do {
+            try process.run()
+        } catch {
+            client.close(reason: error.localizedDescription)
+            throw NvimHostError.launchFailed(error.localizedDescription)
+        }
+
+        self.process = process
+        self.rpcClient = client
+        self.standardInputPipe = inputPipe
+        self.standardOutputPipe = outputPipe
+        stopping = false
+    }
+
+    private func configure() async throws {
+        let apiInfo = try await rawRequest("nvim_get_api_info")
+        guard let values = apiInfo.arrayValue,
+              let channel = values.first?.intValue else {
+            throw NvimHostError.invalidResponse(method: "nvim_get_api_info")
+        }
+        try await configureStep(name: "base options", source: Self.configurationLua, arguments: [])
+        try await configureStep(
+            name: "clipboard provider",
+            source: Self.clipboardProviderLua,
+            arguments: [.int(channel)]
+        )
+        try await configureStep(name: "clipboard option", source: "vim.o.clipboard = 'unnamedplus'", arguments: [])
+        try await configureStep(name: "safety mappings", source: Self.safetyMappingsLua, arguments: [])
+    }
+
+    private func configureStep(
+        name: String,
+        source: String,
+        arguments: [MessagePackValue]
+    ) async throws {
+        do {
+            _ = try await rawRequest("nvim_exec_lua", [
+                .string(source),
+                .array(arguments),
+            ])
+        } catch {
+            throw NvimHostError.configurationFailed(stage: name, message: error.localizedDescription)
+        }
+    }
+
+    private func withRestart<T>(
+        operation: () async throws -> T
+    ) async throws -> T {
+        do {
+            try await ensureRunning(recovering: true)
+            return try await operation()
+        } catch {
+            guard !stopping else { throw error }
+            await tearDownForRestart()
+            try await ensureRunning(recovering: false)
+            if let recoverySnapshot {
+                try await loadInternal(
+                    text: recoverySnapshot.text,
+                    selection: recoverySnapshot.selection ?? .caret(at: recoverySnapshot.cursor),
+                    desiredMode: recoverySnapshot.mode
+                )
+            }
+            return try await operation()
+        }
+    }
+
+    private func tearDownForRestart() async {
+        let oldClient = rpcClient
+        let oldProcess = process
+        rpcClient = nil
+        process = nil
+        standardInputPipe = nil
+        standardOutputPipe = nil
+        oldClient?.close(reason: "Restarting Neovim")
+        if oldProcess?.isRunning == true { oldProcess?.terminate() }
+    }
+
+    private func rawRequest(
+        _ method: String,
+        _ parameters: [MessagePackValue] = []
+    ) async throws -> MessagePackValue {
+        guard let rpcClient else { throw NvimHostError.notRunning }
+        return try await rpcClient.request(method: method, parameters: parameters)
+    }
+
+    private func loadInternal(
+        text: String,
+        selection: EditorSelection,
+        desiredMode: VimMode
+    ) async throws {
+        _ = try await rawRequest("nvim_exec_lua", [
+            .string(Self.beforeLoadLua),
+            .array([]),
+        ])
+        let lines = text.components(separatedBy: "\n").map(MessagePackValue.string)
+        _ = try await rawRequest("nvim_buf_set_lines", [
+            .int(0), .int(0), .int(-1), .bool(true), .array(lines),
+        ])
+        _ = try await rawRequest("nvim_exec_lua", [
+            .string(Self.afterLoadLua),
+            .array([]),
+        ])
+        try await applySelection(selection)
+
+        switch desiredMode {
+        case .insert:
+            try await inputNotation("i")
+        case .replace:
+            try await inputNotation("R")
+        default:
+            break
+        }
+    }
+
+    private func applySelection(_ selection: EditorSelection) async throws {
+        try await inputNotation("<Esc><Esc>")
+        _ = try await rawRequest("nvim_win_set_cursor", [
+            .int(0),
+            .array([.int(Int64(selection.anchor.line + 1)), .int(Int64(selection.anchor.utf8Column))]),
+        ])
+
+        switch selection.kind {
+        case .caret:
+            break
+        case .character:
+            try await inputNotation("v")
+            _ = try await rawRequest("nvim_win_set_cursor", [
+                .int(0),
+                .array([.int(Int64(selection.head.line + 1)), .int(Int64(selection.head.utf8Column))]),
+            ])
+        case .line:
+            try await inputNotation("V")
+            _ = try await rawRequest("nvim_win_set_cursor", [
+                .int(0),
+                .array([.int(Int64(selection.head.line + 1)), .int(Int64(selection.head.utf8Column))]),
+            ])
+        }
+    }
+
+    private func inputNotation(_ notation: String) async throws {
+        let encoded = try await rawRequest(
+            "nvim_replace_termcodes",
+            [.string(notation), .bool(true), .bool(false), .bool(true)]
+        )
+        guard let keys = encoded.stringValue else {
+            throw NvimHostError.invalidResponse(method: "nvim_replace_termcodes")
+        }
+        _ = try await rawRequest("nvim_input", [.string(keys)])
+        _ = try await rawRequest("nvim_eval", [.string("0")])
+    }
+
+    private func decodeSnapshot(_ value: MessagePackValue) throws -> EditorSnapshot {
+        guard let lineValues = value["lines"]?.arrayValue,
+              let cursorValues = value["cursor"]?.arrayValue,
+              cursorValues.count >= 2,
+              let oneBasedLine = cursorValues[0].intValue,
+              let byteColumn = cursorValues[1].intValue,
+              let rawMode = value["mode"]?.stringValue else {
+            throw NvimHostError.invalidResponse(method: "snapshot")
+        }
+
+        let text = lineValues.compactMap(\.stringValue).joined(separator: "\n")
+        let cursor = TextPosition(
+            line: max(0, Int(oneBasedLine) - 1),
+            utf8Column: max(0, Int(byteColumn))
+        )
+        let mode = Self.mode(from: rawMode)
+        var selection: EditorSelection?
+        if let visual = value["visual"]?.arrayValue,
+           visual.count >= 3,
+           let line = visual[0].intValue,
+           let column = visual[1].intValue,
+           let kind = visual[2].stringValue {
+            let anchor = TextPosition(line: Int(line), utf8Column: Int(column))
+            selection = EditorSelection(
+                anchor: anchor,
+                head: cursor,
+                kind: kind == "V" ? .line : .character
+            )
+        }
+
+        let errorMessage = value["error"]?.stringValue
+        let infoMessage = value["info"]?.stringValue
+        let message = [errorMessage, infoMessage]
+            .compactMap { item in item.flatMap { $0.isEmpty ? nil : $0 } }
+            .first
+        let pendingOperator = value["operator"]?.stringValue.flatMap { $0.isEmpty ? nil : $0 }
+        let count = value["count"]?.intValue.flatMap { $0 > 0 ? Int($0) : nil }
+        let command = value["command"]?.stringValue.flatMap { $0.isEmpty ? nil : $0 }
+
+        return EditorSnapshot(
+            text: text,
+            cursor: cursor,
+            selection: selection,
+            mode: mode,
+            message: message,
+            pendingOperator: pendingOperator,
+            pendingCount: count,
+            command: command
+        )
+    }
+
+    private func installClipboardHandlers(on client: MessagePackRPCClient) {
+        let clipboard = self.clipboard
+        client.setRequestHandler { method, parameters in
+            switch method {
+            case "vimany_clipboard_get":
+                let contents = clipboard.readForVim()
+                return .array([
+                    .array(contents.lines.map(MessagePackValue.string)),
+                    .string(contents.registerType),
+                ])
+            case "vimany_clipboard_set":
+                Self.handleClipboardSet(parameters, clipboard: clipboard)
+                return .null
+            default:
+                throw MessagePackRPCError.remote("Unsupported host RPC method: \(method)")
+            }
+        }
+        client.setNotificationHandler { method, parameters in
+            if method == "vimany_clipboard_set" {
+                Self.handleClipboardSet(parameters, clipboard: clipboard)
+            }
+        }
+    }
+
+    private static func handleClipboardSet(
+        _ parameters: [MessagePackValue],
+        clipboard: SystemClipboardService
+    ) {
+        guard parameters.count >= 2,
+              let lineValues = parameters[0].arrayValue,
+              let registerType = parameters[1].stringValue else { return }
+        clipboard.writeFromVim(
+            lines: lineValues.compactMap(\.stringValue),
+            registerType: registerType
+        )
+    }
+
+    private static func mode(from rawMode: String) -> VimMode {
+        if rawMode == "v" || rawMode == "\u{16}" || rawMode.hasPrefix("vs") { return .visual }
+        if rawMode == "V" || rawMode.hasPrefix("Vs") { return .visualLine }
+        if rawMode.hasPrefix("no") { return .operatorPending }
+        if rawMode.hasPrefix("i") { return .insert }
+        if rawMode.hasPrefix("R") { return .replace }
+        if rawMode.hasPrefix("c") { return .commandLine }
+        if rawMode.hasPrefix("n") { return .normal }
+        return .unknown(rawMode)
+    }
+
+    private static func locateNvimExecutable() -> URL? {
+        let environment = ProcessInfo.processInfo.environment
+        var candidates: [String] = []
+        if let configured = environment["VIMANY_NVIM_PATH"], !configured.isEmpty {
+            candidates.append(configured)
+        }
+        if let path = environment["PATH"] {
+            candidates += path.split(separator: ":").map { "\($0)/nvim" }
+        }
+        candidates += [
+            FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin/nvim").path,
+            "/opt/homebrew/bin/nvim",
+            "/usr/local/bin/nvim",
+            "/usr/bin/nvim",
+        ]
+
+        var seen = Set<String>()
+        for candidate in candidates where seen.insert(candidate).inserted {
+            if FileManager.default.isExecutableFile(atPath: candidate) {
+                return URL(fileURLWithPath: candidate)
+            }
+        }
+        return nil
+    }
+
+    private static let configurationLua = #"""
+vim.g.vimany_configured = true
+vim.o.loadplugins = false
+vim.o.modeline = false
+vim.o.exrc = false
+vim.o.swapfile = false
+vim.o.backup = false
+vim.o.writebackup = false
+vim.o.undofile = false
+vim.o.shada = ''
+vim.o.mouse = ''
+vim.o.hidden = true
+vim.o.report = 9999
+vim.o.shortmess = 'filnxtToOF'
+vim.o.clipboard = ''
+vim.bo.buftype = 'nofile'
+vim.bo.bufhidden = 'hide'
+vim.bo.swapfile = false
+vim.bo.undofile = false
+"""#
+
+    private static let clipboardProviderLua = #"""
+local channel = ...
+vim.g.clipboard = {
+  name = 'VimAny macOS clipboard',
+  copy = {
+    ['+'] = function(lines, regtype)
+      vim.rpcnotify(channel, 'vimany_clipboard_set', lines, regtype)
+    end,
+    ['*'] = function(lines, regtype)
+      vim.rpcnotify(channel, 'vimany_clipboard_set', lines, regtype)
+    end,
+  },
+  paste = {
+    ['+'] = function()
+      return vim.rpcrequest(channel, 'vimany_clipboard_get')
+    end,
+    ['*'] = function()
+      return vim.rpcrequest(channel, 'vimany_clipboard_get')
+    end,
+  },
+  cache_enabled = 0,
+}
+"""#
+
+    private static let safetyMappingsLua = #"""
+local normal_blocked = { ':', 'q', '@', 'Q', 'Z', '!', 'm', "'", '`', '"', '<C-z>', 'K' }
+for _, key in ipairs(normal_blocked) do
+  vim.keymap.set('n', key, '<Nop>', { noremap = true, silent = true, nowait = true })
+end
+local visual_blocked = { ':', '@', 'Q', '!', '"', '<C-z>', 'K' }
+for _, key in ipairs(visual_blocked) do
+  vim.keymap.set('x', key, '<Nop>', { noremap = true, silent = true, nowait = true })
+end
+vim.keymap.set('n', 'gQ', '<Nop>', { noremap = true, silent = true })
+vim.keymap.set('n', 'gx', '<Nop>', { noremap = true, silent = true })
+vim.keymap.set('n', 'gf', '<Nop>', { noremap = true, silent = true })
+vim.keymap.set('n', 'gF', '<Nop>', { noremap = true, silent = true })
+vim.keymap.set('n', '<C-]>', '<Nop>', { noremap = true, silent = true })
+vim.keymap.set('n', '<C-^>', '<Nop>', { noremap = true, silent = true })
+vim.keymap.set('c', '<C-f>', '<Nop>', { noremap = true, silent = true })
+vim.keymap.set('c', '<C-r>', '<Nop>', { noremap = true, silent = true })
+vim.keymap.set('c', [[<C-\>]], '<Nop>', { noremap = true, silent = true })
+vim.keymap.set('i', '<C-r>', '<Nop>', { noremap = true, silent = true })
+"""#
+
+    private static let beforeLoadLua = #"""
+vim.api.nvim_input(vim.api.nvim_replace_termcodes('<Esc><Esc>', true, false, true))
+vim.bo.undolevels = -1
+"""#
+
+    private static let afterLoadLua = #"""
+vim.bo.undolevels = 1000
+vim.bo.modified = false
+vim.cmd('silent! clearjumps')
+vim.v.errmsg = ''
+vim.v.statusmsg = ''
+"""#
+
+    private static let snapshotLua = #"""
+local mode = vim.fn.mode(1)
+local cursor = vim.api.nvim_win_get_cursor(0)
+local visual = nil
+if mode == 'v' or mode == 'V' or mode == string.char(22) or mode:sub(1, 2) == 'vs' then
+  local anchor = vim.fn.getpos('v')
+  visual = { anchor[2] - 1, math.max(0, anchor[3] - 1), mode:sub(1, 1) }
+end
+local command = ''
+local command_type = vim.fn.getcmdtype()
+if command_type ~= '' then
+  command = command_type .. vim.fn.getcmdline()
+end
+local result = {
+  lines = vim.api.nvim_buf_get_lines(0, 0, -1, true),
+  cursor = cursor,
+  mode = mode,
+  visual = visual,
+  operator = vim.v.operator or '',
+  count = vim.v.count or 0,
+  command = command,
+  error = vim.v.errmsg or '',
+  info = vim.v.statusmsg or '',
+}
+vim.v.errmsg = ''
+vim.v.statusmsg = ''
+return result
+"""#
+}
