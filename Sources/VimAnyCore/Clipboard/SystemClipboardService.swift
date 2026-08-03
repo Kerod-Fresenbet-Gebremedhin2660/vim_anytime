@@ -22,6 +22,7 @@ public struct PasteboardArchive: Sendable {
 /// Owns user-visible clipboard operations caused by Vim editing commands.
 /// Temporary clipboard use for AX fallback deliberately goes through separate APIs.
 public final class SystemClipboardService: @unchecked Sendable {
+    private let logger = DiagnosticLogger.shared
     private let pasteboard: NSPasteboard
     private var intentionalRevisionStorage: UInt64 = 0
 
@@ -34,7 +35,12 @@ public final class SystemClipboardService: @unchecked Sendable {
     }
 
     public func readText() -> String? {
-        onMain { self.pasteboard.string(forType: .string) }
+        let text = onMain { self.pasteboard.string(forType: .string) }
+        logger.debug(
+            "Clipboard",
+            "intentional read utf16Length=\(text?.utf16.count ?? 0) available=\(text != nil)"
+        )
+        return text
     }
 
     public func writeTextIntentionally(_ text: String) {
@@ -42,10 +48,19 @@ public final class SystemClipboardService: @unchecked Sendable {
             self.intentionalRevisionStorage &+= 1
             self.pasteboard.clearContents()
             self.pasteboard.setString(text, forType: .string)
+            self.logger.info(
+                "Clipboard",
+                "intentional write utf16Length=\(text.utf16.count) "
+                    + "revision=\(self.intentionalRevisionStorage)"
+            )
         }
     }
 
     public func writeFromVim(lines: [String], registerType: String) {
+        logger.debug(
+            "Clipboard",
+            "Vim write received lineCount=\(lines.count) registerType=\(registerType)"
+        )
         let text: String
         if registerType.first == "V" {
             var normalizedLines = lines
@@ -69,7 +84,12 @@ public final class SystemClipboardService: @unchecked Sendable {
             lines.removeLast()
         }
         if lines.isEmpty { lines = [""] }
-        return (lines, linewise ? "V" : "v")
+        let registerType = linewise ? "V" : "v"
+        logger.debug(
+            "Clipboard",
+            "Vim read supplied lineCount=\(lines.count) registerType=\(registerType)"
+        )
+        return (lines, registerType)
     }
 
     public func archive() -> PasteboardArchive {
@@ -81,7 +101,16 @@ public final class SystemClipboardService: @unchecked Sendable {
                 }
                 return PasteboardItemArchive(values: values)
             }
-            return PasteboardArchive(items: items, intentionalRevision: self.intentionalRevisionStorage)
+            let archive = PasteboardArchive(
+                items: items,
+                intentionalRevision: self.intentionalRevisionStorage
+            )
+            self.logger.debug(
+                "Clipboard",
+                "archive created itemCount=\(items.count) "
+                    + "revision=\(self.intentionalRevisionStorage)"
+            )
+            return archive
         }
     }
 
@@ -91,7 +120,13 @@ public final class SystemClipboardService: @unchecked Sendable {
         onMain {
             self.pasteboard.clearContents()
             self.pasteboard.setString(text, forType: .string)
-            return self.pasteboard.changeCount
+            let changeCount = self.pasteboard.changeCount
+            self.logger.debug(
+                "Clipboard",
+                "temporary replacement installed utf16Length=\(text.utf16.count) "
+                    + "changeCount=\(changeCount)"
+            )
+            return changeCount
         }
     }
 
@@ -101,8 +136,21 @@ public final class SystemClipboardService: @unchecked Sendable {
         expectedChangeCount: Int
     ) -> Bool {
         onMain {
-            guard self.pasteboard.changeCount == expectedChangeCount,
-                  self.intentionalRevisionStorage == archive.intentionalRevision else {
+            guard self.pasteboard.changeCount == expectedChangeCount else {
+                self.logger.warning(
+                    "Clipboard",
+                    "temporary archive not restored because pasteboard changed "
+                        + "expected=\(expectedChangeCount) actual=\(self.pasteboard.changeCount)"
+                )
+                return false
+            }
+            guard self.intentionalRevisionStorage == archive.intentionalRevision else {
+                self.logger.warning(
+                    "Clipboard",
+                    "temporary archive not restored because intentional clipboard revision changed "
+                        + "expected=\(archive.intentionalRevision) "
+                        + "actual=\(self.intentionalRevisionStorage)"
+                )
                 return false
             }
 
@@ -117,6 +165,10 @@ public final class SystemClipboardService: @unchecked Sendable {
             if !restoredItems.isEmpty {
                 self.pasteboard.writeObjects(restoredItems)
             }
+            self.logger.info(
+                "Clipboard",
+                "temporary archive restored itemCount=\(restoredItems.count)"
+            )
             return true
         }
     }

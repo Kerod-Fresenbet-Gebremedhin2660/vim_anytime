@@ -145,6 +145,27 @@ final class NvimCommandIntegrationTests: XCTestCase {
         }
     }
 
+    func testBackspaceDeletesUnicodeTextInInsertMode() async throws {
+        try await withHost { host, _ in
+            try await host.load(
+                text: "",
+                selection: .caret(at: TextPosition(line: 0, utf8Column: 0))
+            )
+            try await host.sendKey(VimKey("i"))
+            try await host.insertText("a😀")
+
+            try await host.sendKey(VimKey("<BS>"))
+            var snapshot = try await host.snapshot()
+            XCTAssertEqual(snapshot.text, "a")
+            XCTAssertEqual(snapshot.mode, .insert)
+
+            try await host.sendKey(VimKey("<BS>"))
+            snapshot = try await host.snapshot()
+            XCTAssertEqual(snapshot.text, "")
+            XCTAssertEqual(snapshot.mode, .insert)
+        }
+    }
+
     func testUnexpectedNeovimExitRestartsAndRecoversLatestSnapshot() async throws {
         try await withHost { host, _ in
             try await host.load(

@@ -29,6 +29,7 @@ public final class MessagePackRPCClient: @unchecked Sendable {
 
     private let input: FileHandle
     private let output: FileHandle
+    private let logger = DiagnosticLogger.shared
     private let stateLock = NSLock()
     private let writeLock = NSLock()
     private let decodeQueue = DispatchQueue(label: "dev.vimany.msgpack.decode", qos: .userInteractive)
@@ -38,11 +39,12 @@ public final class MessagePackRPCClient: @unchecked Sendable {
     private var closeError: Error?
     private var requestHandler: RequestHandler?
     private var notificationHandler: NotificationHandler?
-    private let debugEnabled = ProcessInfo.processInfo.environment["VIMANY_RPC_DEBUG"] == "1"
+    private let mirrorsDebugToStandardError = ProcessInfo.processInfo.environment["VIMANY_RPC_DEBUG"] == "1"
 
     public init(input: FileHandle, output: FileHandle) {
         self.input = input
         self.output = output
+        logger.info("RPC", "client initialized")
         beginReading()
     }
 
@@ -104,6 +106,7 @@ public final class MessagePackRPCClient: @unchecked Sendable {
     }
 
     public func notify(method: String, parameters: [MessagePackValue] = []) throws {
+        debug("send notification \(method)")
         try stateLock.withLock {
             if let closeError { throw closeError }
         }
@@ -119,6 +122,7 @@ public final class MessagePackRPCClient: @unchecked Sendable {
     }
 
     private func beginReading() {
+        debug("begin reading")
         input.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             guard let self else { return }
@@ -150,6 +154,7 @@ public final class MessagePackRPCClient: @unchecked Sendable {
             } catch MessagePackCodingError.needMoreData {
                 return
             } catch {
+                logger.error("RPC", error: error, context: "MessagePack decode failed")
                 close(with: error)
                 return
             }
@@ -159,6 +164,7 @@ public final class MessagePackRPCClient: @unchecked Sendable {
     private func handle(_ value: MessagePackValue) {
         guard case .array(let parts) = value,
               let kind = parts.first?.intValue else {
+            logger.error("RPC", "received malformed top-level frame")
             close(with: MessagePackRPCError.malformedMessage)
             return
         }
@@ -171,12 +177,14 @@ public final class MessagePackRPCClient: @unchecked Sendable {
         case 2:
             handleNotification(parts)
         default:
+            logger.error("RPC", "received unknown message kind=\(kind)")
             close(with: MessagePackRPCError.malformedMessage)
         }
     }
 
     private func handleResponse(_ parts: [MessagePackValue]) {
         guard parts.count == 4, let messageID = parts[1].intValue else {
+            logger.error("RPC", "received malformed response")
             close(with: MessagePackRPCError.malformedMessage)
             return
         }
@@ -188,7 +196,9 @@ public final class MessagePackRPCClient: @unchecked Sendable {
         if parts[2] == .null {
             request.continuation.resume(returning: parts[3])
         } else {
-            request.continuation.resume(throwing: MessagePackRPCError.remote(describe(parts[2])))
+            let message = describe(parts[2])
+            logger.error("RPC", "remote error method=\(request.method) message=\(message)")
+            request.continuation.resume(throwing: MessagePackRPCError.remote(message))
         }
     }
 
@@ -197,15 +207,18 @@ public final class MessagePackRPCClient: @unchecked Sendable {
               let messageID = parts[1].intValue,
               let method = parts[2].stringValue,
               let parameters = parts[3].arrayValue else {
+            logger.error("RPC", "received malformed host request")
             close(with: MessagePackRPCError.malformedMessage)
             return
         }
 
         let handler = stateLock.withLock { requestHandler }
+        debug("receive host request \(messageID) \(method)")
         do {
             let result = try handler?(method, parameters) ?? .null
             try write(.array([.int(1), .int(messageID), .null, result]))
         } catch {
+            logger.error("RPC", error: error, context: "host request failed method=\(method)")
             let rpcError: MessagePackValue = .array([
                 .int(0),
                 .string(error.localizedDescription),
@@ -218,10 +231,12 @@ public final class MessagePackRPCClient: @unchecked Sendable {
         guard parts.count == 3,
               let method = parts[1].stringValue,
               let parameters = parts[2].arrayValue else {
+            logger.error("RPC", "received malformed notification")
             close(with: MessagePackRPCError.malformedMessage)
             return
         }
         let handler = stateLock.withLock { notificationHandler }
+        debug("receive notification \(method)")
         handler?(method, parameters)
     }
 
@@ -233,17 +248,26 @@ public final class MessagePackRPCClient: @unchecked Sendable {
             }
         } catch {
             let wrapped = MessagePackRPCError.transport(error.localizedDescription)
+            logger.error("RPC", error: wrapped, context: "transport write failed")
             close(with: wrapped)
             throw wrapped
         }
     }
 
     private func timeOut(messageID: Int64, method: String) {
+        logger.error("RPC", "request timed out id=\(messageID) method=\(method)")
         failPending(messageID: messageID, error: MessagePackRPCError.timedOut(method: method))
     }
 
     private func failPending(messageID: Int64, error: Error) {
         let request = stateLock.withLock { pending.removeValue(forKey: messageID) }
+        if request != nil {
+            logger.warning(
+                "RPC",
+                "pending request failed id=\(messageID) method=\(request?.method ?? "unknown") "
+                    + "error=\(error.localizedDescription)"
+            )
+        }
         request?.continuation.resume(throwing: error)
     }
 
@@ -256,6 +280,24 @@ public final class MessagePackRPCClient: @unchecked Sendable {
             return values
         }
         input.readabilityHandler = nil
+        let expectedClosure: Bool
+        if let rpcError = error as? MessagePackRPCError,
+           case .closed(let reason) = rpcError {
+            expectedClosure = reason == "VimAny is stopping" || reason == "Restarting Neovim"
+        } else {
+            expectedClosure = false
+        }
+        if expectedClosure {
+            logger.info(
+                "RPC",
+                "client closed normally pendingCount=\(requests.count) reason=\(error.localizedDescription)"
+            )
+        } else {
+            logger.warning(
+                "RPC",
+                "client closed pendingCount=\(requests.count) reason=\(error.localizedDescription)"
+            )
+        }
         for request in requests {
             request.continuation.resume(throwing: error)
         }
@@ -270,7 +312,8 @@ public final class MessagePackRPCClient: @unchecked Sendable {
     }
 
     private func debug(_ message: String) {
-        guard debugEnabled else { return }
+        logger.debug("RPC", message)
+        guard mirrorsDebugToStandardError else { return }
         let line = Data("[VimAny RPC] \(message)\n".utf8)
         try? FileHandle.standardError.write(contentsOf: line)
     }

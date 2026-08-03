@@ -17,6 +17,7 @@ public final class ClipboardFallbackService: ClipboardFallbackWriting {
     public typealias PasteAction = @Sendable (pid_t) async -> Bool
 
     private let clipboard: SystemClipboardService
+    private let logger = DiagnosticLogger.shared
     private let pasteAction: PasteAction
     private let restorationDelayNanoseconds: UInt64
 
@@ -41,6 +42,10 @@ public final class ClipboardFallbackService: ClipboardFallbackWriting {
         target: AccessibilityTextTarget,
         focusTarget: () -> Void
     ) async -> Bool {
+        logger.info(
+            "ClipboardFallback",
+            "replacement started pid=\(target.processIdentifier) utf16Length=\(text.utf16.count)"
+        )
         let archive = clipboard.archive()
         let temporaryChangeCount = clipboard.installTemporaryText(text)
         focusTarget()
@@ -49,20 +54,42 @@ public final class ClipboardFallbackService: ClipboardFallbackWriting {
         if restorationDelayNanoseconds > 0 {
             try? await Task.sleep(nanoseconds: restorationDelayNanoseconds)
         }
-        _ = clipboard.restoreTemporaryArchive(
+        let didRestore = clipboard.restoreTemporaryArchive(
             archive,
             expectedChangeCount: temporaryChangeCount
+        )
+        logger.info(
+            "ClipboardFallback",
+            "replacement completed pid=\(target.processIdentifier) pasted=\(didPaste) "
+                + "clipboardRestored=\(didRestore)"
         )
         return didPaste
     }
 
     nonisolated private static func postSelectAllAndPaste(to processIdentifier: pid_t) async -> Bool {
-        guard AXIsProcessTrusted(),
-              postCommandKey(keyCode: 0, to: processIdentifier) else {
+        guard AXIsProcessTrusted() else {
+            DiagnosticLogger.shared.error(
+                "ClipboardFallback",
+                "synthetic paste blocked because Accessibility is not trusted"
+            )
+            return false
+        }
+        guard postCommandKey(keyCode: 0, to: processIdentifier) else {
+            DiagnosticLogger.shared.error(
+                "ClipboardFallback",
+                "could not post Command-A pid=\(processIdentifier)"
+            )
             return false
         }
         try? await Task.sleep(nanoseconds: 20_000_000)
-        return postCommandKey(keyCode: 9, to: processIdentifier)
+        let pasted = postCommandKey(keyCode: 9, to: processIdentifier)
+        if !pasted {
+            DiagnosticLogger.shared.error(
+                "ClipboardFallback",
+                "could not post Command-V pid=\(processIdentifier)"
+            )
+        }
+        return pasted
     }
 
     nonisolated private static func postCommandKey(keyCode: CGKeyCode, to processIdentifier: pid_t) -> Bool {

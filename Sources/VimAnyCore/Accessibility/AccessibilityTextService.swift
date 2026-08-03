@@ -76,6 +76,7 @@ public protocol AccessibilityTextServicing: AnyObject {
 
 @MainActor
 public final class AccessibilityTextService: AccessibilityTextServicing {
+    private let logger = DiagnosticLogger.shared
     private let systemWideElement = AXUIElementCreateSystemWide()
 
     public init() {}
@@ -86,16 +87,25 @@ public final class AccessibilityTextService: AccessibilityTextServicing {
 
     public static func requestPermissionPrompt() {
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-        _ = AXIsProcessTrustedWithOptions(options)
+        let trusted = AXIsProcessTrustedWithOptions(options)
+        DiagnosticLogger.shared.info(
+            "Accessibility",
+            "permission check with prompt completed trusted=\(trusted)"
+        )
     }
 
     public func captureFocusedTextField() throws -> CapturedTextField {
-        guard Self.isTrusted else { throw AccessibilityTextError.permissionDenied }
+        logger.info("Accessibility", "focused field capture started trusted=\(Self.isTrusted)")
+        guard Self.isTrusted else {
+            logger.error("Accessibility", "focused field capture denied by TCC")
+            throw AccessibilityTextError.permissionDenied
+        }
 
         guard let application = copyElementAttribute(
             kAXFocusedApplicationAttribute as CFString,
             from: systemWideElement
         ) else {
+            logger.error("Accessibility", "kAXFocusedApplicationAttribute unavailable")
             throw AccessibilityTextError.noFocusedApplication
         }
 
@@ -103,10 +113,12 @@ public final class AccessibilityTextService: AccessibilityTextServicing {
             kAXFocusedUIElementAttribute as CFString,
             from: application
         ) else {
+            logger.error("Accessibility", "kAXFocusedUIElementAttribute unavailable")
             throw AccessibilityTextError.noFocusedTextElement
         }
 
         guard let text = copyAttribute(kAXValueAttribute as CFString, from: element) as? String else {
+            logger.error("Accessibility", "focused element has no plain String AX value")
             throw AccessibilityTextError.valueUnavailable
         }
 
@@ -119,6 +131,11 @@ public final class AccessibilityTextService: AccessibilityTextServicing {
             applicationElement: application,
             textElement: element,
             processIdentifier: processIdentifier
+        )
+        logger.info(
+            "Accessibility",
+            "capture succeeded app=\(applicationName ?? "unknown") pid=\(processIdentifier) "
+                + "utf16Length=\(text.utf16.count) selection=\(NSStringFromRange(selectedRange))"
         )
         return CapturedTextField(
             text: text,
@@ -138,40 +155,85 @@ public final class AccessibilityTextService: AccessibilityTextServicing {
             kAXValueAttribute as CFString,
             text as CFTypeRef
         )
-        guard result == .success else { return false }
+        guard result == .success else {
+            logger.warning(
+                "Accessibility",
+                "direct AX value write failed pid=\(target.processIdentifier) "
+                    + "error=\(result.rawValue) utf16Length=\(text.utf16.count)"
+            )
+            return false
+        }
+        logger.info(
+            "Accessibility",
+            "direct AX value write succeeded pid=\(target.processIdentifier) "
+                + "utf16Length=\(text.utf16.count)"
+        )
         writeSelection(selectionRange, to: target)
         return true
     }
 
     public func writeSelection(_ selectionRange: NSRange, to target: AccessibilityTextTarget) {
         var range = CFRange(location: selectionRange.location, length: selectionRange.length)
-        guard let value = AXValueCreate(.cfRange, &range) else { return }
-        AXUIElementSetAttributeValue(
+        guard let value = AXValueCreate(.cfRange, &range) else {
+            logger.error("Accessibility", "could not create AX selection value")
+            return
+        }
+        let result = AXUIElementSetAttributeValue(
             target.textElement,
             kAXSelectedTextRangeAttribute as CFString,
             value
         )
+        if result == .success {
+            logger.debug(
+                "Accessibility",
+                "selection write succeeded pid=\(target.processIdentifier) "
+                    + "range=\(NSStringFromRange(selectionRange))"
+            )
+        } else {
+            logger.warning(
+                "Accessibility",
+                "selection write failed pid=\(target.processIdentifier) error=\(result.rawValue) "
+                    + "range=\(NSStringFromRange(selectionRange))"
+            )
+        }
     }
 
     public func restoreFocus(to target: AccessibilityTextTarget) {
+        logger.info("Accessibility", "restoring focus pid=\(target.processIdentifier)")
         if let application = NSRunningApplication(processIdentifier: target.processIdentifier) {
-            application.activate(options: [.activateIgnoringOtherApps])
+            let activated = application.activate(options: [.activateIgnoringOtherApps])
+            logger.debug("Accessibility", "application activation result=\(activated)")
+        } else {
+            logger.warning(
+                "Accessibility",
+                "target process no longer has an NSRunningApplication pid=\(target.processIdentifier)"
+            )
         }
-        AXUIElementSetAttributeValue(
+        let applicationFocusResult = AXUIElementSetAttributeValue(
             target.applicationElement,
             kAXFocusedUIElementAttribute as CFString,
             target.textElement
         )
-        AXUIElementSetAttributeValue(
+        let elementFocusResult = AXUIElementSetAttributeValue(
             target.textElement,
             kAXFocusedAttribute as CFString,
             kCFBooleanTrue
+        )
+        logger.debug(
+            "Accessibility",
+            "focus AX results application=\(applicationFocusResult.rawValue) "
+                + "element=\(elementFocusResult.rawValue)"
         )
     }
 
     private func copyAttribute(_ attribute: CFString, from element: AXUIElement) -> CFTypeRef? {
         var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, attribute, &value) == .success else {
+        let result = AXUIElementCopyAttributeValue(element, attribute, &value)
+        guard result == .success else {
+            logger.warning(
+                "Accessibility",
+                "attribute read failed attribute=\(attribute) error=\(result.rawValue)"
+            )
             return nil
         }
         return value
@@ -199,4 +261,3 @@ public final class AccessibilityTextService: AccessibilityTextServicing {
         return NSRange(location: range.location, length: range.length)
     }
 }
-

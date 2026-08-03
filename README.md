@@ -19,16 +19,33 @@ Open `Package.swift` in Xcode to develop and run tests, or build an application 
 open .build/VimAny.app
 ```
 
-On first use, macOS asks for Accessibility access. Enable VimAny in **System Settings → Privacy & Security → Accessibility**, then trigger the default shortcut, `⌃⌥⌘V`.
+On first use, macOS asks for Accessibility access. Enable VimAny in **System Settings → Privacy & Security → Accessibility**, then trigger the default shortcut, `⌃M`.
+
+If VimAny is checked there but still reports that permission is required, reset the stale grant and authorize the current bundle once:
+
+```sh
+tccutil reset Accessibility dev.vimany.VimAny
+open .build/VimAny.app
+```
+
+The development build uses a stable designated requirement, so the refreshed grant survives later runs of `build-app.sh`. Set `VIMANY_CODESIGN_IDENTITY` to use an installed signing identity instead.
 
 The shortcut is persisted with `UserDefaults`. Until the preferences UI is added, it can be changed with key code and Carbon modifier values:
 
 ```sh
-defaults write dev.vimany.VimAny GlobalShortcutKeyCode -int 9
-defaults write dev.vimany.VimAny GlobalShortcutModifiers -int 6400
+defaults write dev.vimany.VimAny GlobalShortcutKeyCode -int 46
+defaults write dev.vimany.VimAny GlobalShortcutModifiers -int 4096
 ```
 
 Restart VimAny after changing those values.
+
+## Diagnostics
+
+The development app writes structured diagnostics to `VimAny.log` in this project directory. The file persists across launches and separates each run with a timestamped `Session` entry. Choose **Reveal VimAny.log** from the menu bar item to locate it, then attach that one file when reporting a problem.
+
+Diagnostics include application lifecycle, Accessibility results, shortcut registration, panel state, Neovim process/restart events, MessagePack-RPC method traffic, cursor coordinates, and clipboard fallback outcomes. Field text, inserted text, searches, and clipboard contents are not recorded; only their sizes and related coordinates are logged.
+
+Set `VIMANY_LOG_PATH` to an absolute path before launch to override the destination. If the app is moved outside this development project, it falls back to `~/Library/Application Support/VimAny/VimAny.log`.
 
 ## Editing
 
@@ -39,4 +56,3 @@ Restart VimAny after changing those values.
 - `:w`, `:wq`, `:x`, `:q`, `:q!`, `:undo`, `:redo`, and `:nohlsearch` form the intentionally small Ex whitelist. Other Ex commands are rejected in the native status line. Shell commands are never passed to Neovim.
 
 See [Implementation Plan](Documentation/IMPLEMENTATION_PLAN.md) for architecture, scope, and the proposed Xcode grouping.
-

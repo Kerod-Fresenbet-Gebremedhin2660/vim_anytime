@@ -24,12 +24,14 @@ public enum NvimHostError: Error, LocalizedError, Sendable {
 }
 
 public actor NvimHost: NvimEditingEngine {
+    private let logger = DiagnosticLogger.shared
     private let clipboard: SystemClipboardService
     private let executableURL: URL?
     private var process: Process?
     private var rpcClient: MessagePackRPCClient?
     private var standardInputPipe: Pipe?
     private var standardOutputPipe: Pipe?
+    private var standardErrorPipe: Pipe?
     private var stopping = false
     private var recoverySnapshot: EditorSnapshot?
 
@@ -42,11 +44,23 @@ public actor NvimHost: NvimEditingEngine {
     }
 
     public func start() async throws {
+        logger.info("Neovim", "start requested")
         stopping = false
-        try await ensureRunning(recovering: true)
+        do {
+            try await ensureRunning(recovering: true)
+            logger.info("Neovim", "start completed")
+        } catch {
+            logger.error("Neovim", error: error, context: "start failed")
+            throw error
+        }
     }
 
     public func load(text: String, selection: EditorSelection) async throws {
+        logger.info(
+            "Neovim",
+            "buffer load utf16Length=\(text.utf16.count) utf8Length=\(text.utf8.count) "
+                + "selection=\(Self.describe(selection))"
+        )
         try await withRestart {
             try await self.loadInternal(text: text, selection: selection, desiredMode: .normal)
         }
@@ -54,21 +68,18 @@ public actor NvimHost: NvimEditingEngine {
     }
 
     public func sendKey(_ key: VimKey) async throws {
+        logger.debug("Neovim", "key input \(Self.describe(key))")
         try await withRestart {
-            let encoded = try await self.rawRequest(
-                "nvim_replace_termcodes",
-                [.string(key.notation), .bool(true), .bool(false), .bool(true)]
-            )
-            guard let keys = encoded.stringValue else {
-                throw NvimHostError.invalidResponse(method: "nvim_replace_termcodes")
-            }
-            _ = try await self.rawRequest("nvim_input", [.string(keys)])
-            _ = try await self.rawRequest("nvim_eval", [.string("0")])
+            try await self.inputNotation(key.notation)
         }
     }
 
     public func insertText(_ text: String) async throws {
         guard !text.isEmpty else { return }
+        logger.debug(
+            "Neovim",
+            "committed text input utf16Length=\(text.utf16.count) utf8Length=\(text.utf8.count)"
+        )
         try await withRestart {
             _ = try await self.rawRequest(
                 "nvim_paste",
@@ -87,10 +98,18 @@ public actor NvimHost: NvimEditingEngine {
         }
         let snapshot = try decodeSnapshot(result)
         recoverySnapshot = snapshot
+        logger.debug(
+            "Neovim",
+            "snapshot mode=\(snapshot.mode.displayName) cursor=\(Self.describe(snapshot.cursor)) "
+                + "selection=\(snapshot.selection.map(Self.describe) ?? "none") "
+                + "utf16Length=\(snapshot.text.utf16.count) "
+                + "messagePresent=\(snapshot.message != nil)"
+        )
         return snapshot
     }
 
     public func execute(_ command: SafeExCommand) async throws {
+        logger.info("Neovim", "safe command=\(String(describing: command))")
         switch command {
         case .undo:
             try await sendKey(VimKey("u"))
@@ -110,12 +129,14 @@ public actor NvimHost: NvimEditingEngine {
     }
 
     public func setNativeSelection(_ selection: EditorSelection) async throws {
+        logger.debug("Neovim", "native selection update \(Self.describe(selection))")
         try await withRestart {
             try await self.applySelection(selection)
         }
     }
 
     public func reset() async throws {
+        logger.info("Neovim", "buffer reset requested")
         try await withRestart {
             try await self.loadInternal(
                 text: "",
@@ -124,9 +145,11 @@ public actor NvimHost: NvimEditingEngine {
             )
         }
         recoverySnapshot = nil
+        logger.info("Neovim", "buffer reset completed")
     }
 
     public func stop() async {
+        logger.info("Neovim", "stop requested")
         stopping = true
         let oldClient = rpcClient
         let oldProcess = process
@@ -134,10 +157,14 @@ public actor NvimHost: NvimEditingEngine {
         process = nil
         standardInputPipe = nil
         standardOutputPipe = nil
+        standardErrorPipe?.fileHandleForReading.readabilityHandler = nil
+        standardErrorPipe = nil
         oldClient?.close(reason: "VimAny is stopping")
+        oldProcess?.terminationHandler = nil
         if oldProcess?.isRunning == true {
             oldProcess?.terminate()
         }
+        logger.info("Neovim", "stop completed")
     }
 
     public func isProcessRunning() -> Bool {
@@ -149,10 +176,19 @@ public actor NvimHost: NvimEditingEngine {
     }
 
     private func ensureRunning(recovering: Bool) async throws {
-        if process?.isRunning == true, rpcClient != nil { return }
+        if process?.isRunning == true, rpcClient != nil {
+            logger.debug("Neovim", "existing process is healthy")
+            return
+        }
+        logger.info("Neovim", "launch required recovering=\(recovering)")
         try launch()
         try await configure()
         if recovering, let recoverySnapshot {
+            logger.info(
+                "Neovim",
+                "recovering buffer utf16Length=\(recoverySnapshot.text.utf16.count) "
+                    + "mode=\(recoverySnapshot.mode.displayName)"
+            )
             let selection = recoverySnapshot.selection
                 ?? .caret(at: recoverySnapshot.cursor)
             try await loadInternal(
@@ -165,16 +201,21 @@ public actor NvimHost: NvimEditingEngine {
 
     private func launch() throws {
         let url = executableURL ?? Self.locateNvimExecutable()
-        guard let url else { throw NvimHostError.executableNotFound }
+        guard let url else {
+            logger.error("Neovim", "executable lookup failed")
+            throw NvimHostError.executableNotFound
+        }
+        logger.info("Neovim", "launching executable=\(url.path)")
 
         let process = Process()
         let inputPipe = Pipe()
         let outputPipe = Pipe()
+        let errorPipe = Pipe()
         process.executableURL = url
         process.arguments = ["--embed", "--headless", "--clean", "-i", "NONE"]
         process.standardInput = inputPipe
         process.standardOutput = outputPipe
-        process.standardError = FileHandle.nullDevice
+        process.standardError = errorPipe
         var environment = ProcessInfo.processInfo.environment
         environment["NVIM_APPNAME"] = "vimany-embedded"
         process.environment = environment
@@ -184,14 +225,28 @@ public actor NvimHost: NvimEditingEngine {
             output: inputPipe.fileHandleForWriting
         )
         installClipboardHandlers(on: client)
+        errorPipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            let message = String(data: data, encoding: .utf8)
+                ?? "non-UTF8 stderr bytes=\(data.count)"
+            DiagnosticLogger.shared.warning("Neovim stderr", message)
+        }
         process.terminationHandler = { [weak client] process in
+            DiagnosticLogger.shared.warning(
+                "Neovim",
+                "process exited status=\(process.terminationStatus) "
+                    + "reason=\(String(describing: process.terminationReason))"
+            )
             client?.close(reason: "Neovim exited with status \(process.terminationStatus)")
         }
 
         do {
             try process.run()
         } catch {
+            errorPipe.fileHandleForReading.readabilityHandler = nil
             client.close(reason: error.localizedDescription)
+            logger.error("Neovim", error: error, context: "Process.run failed")
             throw NvimHostError.launchFailed(error.localizedDescription)
         }
 
@@ -199,10 +254,13 @@ public actor NvimHost: NvimEditingEngine {
         self.rpcClient = client
         self.standardInputPipe = inputPipe
         self.standardOutputPipe = outputPipe
+        self.standardErrorPipe = errorPipe
         stopping = false
+        logger.info("Neovim", "process launched pid=\(process.processIdentifier)")
     }
 
     private func configure() async throws {
+        logger.info("Neovim", "deterministic configuration started")
         let apiInfo = try await rawRequest("nvim_get_api_info")
         guard let values = apiInfo.arrayValue,
               let channel = values.first?.intValue else {
@@ -216,6 +274,7 @@ public actor NvimHost: NvimEditingEngine {
         )
         try await configureStep(name: "clipboard option", source: "vim.o.clipboard = 'unnamedplus'", arguments: [])
         try await configureStep(name: "safety mappings", source: Self.safetyMappingsLua, arguments: [])
+        logger.info("Neovim", "deterministic configuration completed channel=\(channel)")
     }
 
     private func configureStep(
@@ -223,14 +282,17 @@ public actor NvimHost: NvimEditingEngine {
         source: String,
         arguments: [MessagePackValue]
     ) async throws {
+        logger.debug("Neovim", "configuration step started name=\(name)")
         do {
             _ = try await rawRequest("nvim_exec_lua", [
                 .string(source),
                 .array(arguments),
             ])
         } catch {
+            logger.error("Neovim", error: error, context: "configuration step failed name=\(name)")
             throw NvimHostError.configurationFailed(stage: name, message: error.localizedDescription)
         }
+        logger.debug("Neovim", "configuration step completed name=\(name)")
     }
 
     private func withRestart<T>(
@@ -241,27 +303,42 @@ public actor NvimHost: NvimEditingEngine {
             return try await operation()
         } catch {
             guard !stopping else { throw error }
+            logger.warning(
+                "Neovim",
+                "operation failed; restarting embedded process error=\(error.localizedDescription)"
+            )
             await tearDownForRestart()
-            try await ensureRunning(recovering: false)
-            if let recoverySnapshot {
-                try await loadInternal(
-                    text: recoverySnapshot.text,
-                    selection: recoverySnapshot.selection ?? .caret(at: recoverySnapshot.cursor),
-                    desiredMode: recoverySnapshot.mode
-                )
+            do {
+                try await ensureRunning(recovering: false)
+                if let recoverySnapshot {
+                    try await loadInternal(
+                        text: recoverySnapshot.text,
+                        selection: recoverySnapshot.selection ?? .caret(at: recoverySnapshot.cursor),
+                        desiredMode: recoverySnapshot.mode
+                    )
+                }
+                let result = try await operation()
+                logger.info("Neovim", "automatic restart and operation retry succeeded")
+                return result
+            } catch {
+                logger.error("Neovim", error: error, context: "automatic restart or retry failed")
+                throw error
             }
-            return try await operation()
         }
     }
 
     private func tearDownForRestart() async {
+        logger.info("Neovim", "tearing down process for restart")
         let oldClient = rpcClient
         let oldProcess = process
         rpcClient = nil
         process = nil
         standardInputPipe = nil
         standardOutputPipe = nil
+        standardErrorPipe?.fileHandleForReading.readabilityHandler = nil
+        standardErrorPipe = nil
         oldClient?.close(reason: "Restarting Neovim")
+        oldProcess?.terminationHandler = nil
         if oldProcess?.isRunning == true { oldProcess?.terminate() }
     }
 
@@ -271,6 +348,22 @@ public actor NvimHost: NvimEditingEngine {
     ) async throws -> MessagePackValue {
         guard let rpcClient else { throw NvimHostError.notRunning }
         return try await rpcClient.request(method: method, parameters: parameters)
+    }
+
+    private static func describe(_ key: VimKey) -> String {
+        if key.notation.hasPrefix("<"), key.notation.hasSuffix(">") {
+            return "special=\(key.notation)"
+        }
+        return "printableCharacters=\(key.notation.count) utf8Length=\(key.notation.utf8.count)"
+    }
+
+    private static func describe(_ position: TextPosition) -> String {
+        "line=\(position.line) utf8Column=\(position.utf8Column)"
+    }
+
+    private static func describe(_ selection: EditorSelection) -> String {
+        "kind=\(String(describing: selection.kind)) "
+            + "anchor={\(describe(selection.anchor))} head={\(describe(selection.head))}"
     }
 
     private func loadInternal(
@@ -328,14 +421,10 @@ public actor NvimHost: NvimEditingEngine {
     }
 
     private func inputNotation(_ notation: String) async throws {
-        let encoded = try await rawRequest(
-            "nvim_replace_termcodes",
-            [.string(notation), .bool(true), .bool(false), .bool(true)]
-        )
-        guard let keys = encoded.stringValue else {
-            throw NvimHostError.invalidResponse(method: "nvim_replace_termcodes")
-        }
-        _ = try await rawRequest("nvim_input", [.string(keys)])
+        // nvim_input translates key notation such as <BS> and <Left> itself.
+        // Pre-expanding with nvim_replace_termcodes would return Neovim's
+        // internal K_SPECIAL bytes over RPC, which are not valid UTF-8.
+        _ = try await rawRequest("nvim_input", [.string(notation)])
         _ = try await rawRequest("nvim_eval", [.string("0")])
     }
 
@@ -478,6 +567,7 @@ vim.o.hidden = true
 vim.o.report = 9999
 vim.o.shortmess = 'filnxtToOF'
 vim.o.clipboard = ''
+vim.o.backspace = 'indent,eol,start'
 vim.bo.buftype = 'nofile'
 vim.bo.bufhidden = 'hide'
 vim.bo.swapfile = false

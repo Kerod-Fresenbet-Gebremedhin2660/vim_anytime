@@ -8,11 +8,13 @@ private final class EditorPanel: NSPanel {
 
 @MainActor
 final class EditorPanelController: NSWindowController {
+    private let logger = DiagnosticLogger.shared
     private let viewModel: EditorViewModel
     private let commitCoordinator: FieldCommitCoordinator
     private let textView: VimTextView
     private let statusLine = StatusLineView(frame: .zero)
     private var isPresenting = false
+    private var lastLoggedMode: VimMode?
 
     init(viewModel: EditorViewModel, commitCoordinator: FieldCommitCoordinator) {
         self.viewModel = viewModel
@@ -31,10 +33,15 @@ final class EditorPanelController: NSWindowController {
         panel.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
         panel.isReleasedWhenClosed = false
 
-        textView = VimTextView(frame: .zero, textContainer: nil)
+        // `init(frame:textContainer:)` does not create a TextKit network when
+        // its container is nil. Use the frame-only initializer so snapshots
+        // have a real NSTextStorage/layout manager to render into.
+        textView = VimTextView(frame: .zero)
+        precondition(textView.textStorage != nil, "VimTextView requires a TextKit backing store")
         super.init(window: panel)
         buildContent(in: panel)
         connectEvents()
+        logger.info("Panel", "initialized textStorageAvailable=\(textView.textStorage != nil)")
     }
 
     required init?(coder: NSCoder) {
@@ -43,18 +50,36 @@ final class EditorPanelController: NSWindowController {
 
     func presentForFocusedField() async throws {
         if window?.isVisible == true {
+            logger.info("Panel", "presentation reused existing visible panel")
             NSApp.activate(ignoringOtherApps: true)
             window?.makeKeyAndOrderFront(nil)
             return
         }
-        guard !isPresenting else { return }
+        guard !isPresenting else {
+            logger.warning("Panel", "duplicate presentation ignored while capture is in progress")
+            return
+        }
+        logger.info("Panel", "presentation started")
         isPresenting = true
         defer { isPresenting = false }
 
-        let capture = try commitCoordinator.begin()
+        let capture: CapturedTextField
+        do {
+            capture = try commitCoordinator.begin()
+        } catch {
+            logger.error("Panel", error: error, context: "focused field capture failed")
+            throw error
+        }
+        logger.info(
+            "Panel",
+            "captured app=\(capture.applicationName ?? "unknown") "
+                + "pid=\(capture.target.processIdentifier) utf16Length=\(capture.text.utf16.count) "
+                + "selection=\(NSStringFromRange(capture.selectionRange))"
+        )
         do {
             try await viewModel.load(text: capture.text, selection: capture.editorSelection)
         } catch {
+            logger.error("Panel", error: error, context: "loading field into Neovim failed")
             commitCoordinator.cancel()
             throw error
         }
@@ -63,6 +88,7 @@ final class EditorPanelController: NSWindowController {
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
         window?.makeFirstResponder(textView)
+        logger.info("Panel", "shown frame=\(NSStringFromRect(window?.frame ?? .zero))")
     }
 
     private func buildContent(in panel: NSPanel) {
@@ -123,11 +149,28 @@ final class EditorPanelController: NSWindowController {
             viewModel?.setNativeSelection(selection)
         }
         viewModel.onSnapshot = { [weak self] snapshot in
-            self?.textView.apply(snapshot: snapshot)
-            self?.statusLine.render(snapshot)
+            guard let self else { return }
+            if self.lastLoggedMode != snapshot.mode {
+                self.logger.debug(
+                    "Panel",
+                    "mode changed from=\(self.lastLoggedMode?.displayName ?? "none") "
+                        + "to=\(snapshot.mode.displayName)"
+                )
+                self.lastLoggedMode = snapshot.mode
+            }
+            if let message = snapshot.message {
+                self.logger.warning(
+                    "Panel",
+                    "status message received characterCount=\(message.count) "
+                        + "isError=\(message.hasPrefix("E"))"
+                )
+            }
+            self.textView.apply(snapshot: snapshot)
+            self.statusLine.render(snapshot)
         }
         viewModel.onApplicationCommand = { [weak self] command in
             guard let self else { return }
+            self.logger.info("Panel", "application command=\(String(describing: command))")
             Task { @MainActor in
                 switch command {
                 case .commitAndClose: await self.commit(close: true)
@@ -139,6 +182,7 @@ final class EditorPanelController: NSWindowController {
     }
 
     private func commit(close: Bool) async {
+        logger.info("Panel", "commit started close=\(close)")
         do {
             let snapshot = try await viewModel.snapshotForCommit()
             let selection = snapshot.selection ?? .caret(at: snapshot.cursor)
@@ -150,6 +194,7 @@ final class EditorPanelController: NSWindowController {
                 restoreFocus: close
             )
             guard result != .failed else {
+                logger.error("Panel", "commit failed for all write strategies")
                 if close {
                     NSApp.activate(ignoringOtherApps: true)
                     window?.makeKeyAndOrderFront(nil)
@@ -160,22 +205,27 @@ final class EditorPanelController: NSWindowController {
             }
 
             if close {
+                logger.info("Panel", "commit succeeded strategy=\(String(describing: result)); closing")
                 commitCoordinator.finish()
                 await viewModel.reset()
             } else {
+                logger.info("Panel", "commit succeeded strategy=\(String(describing: result)); staying open")
                 NSApp.activate(ignoringOtherApps: true)
                 window?.makeKeyAndOrderFront(nil)
                 window?.makeFirstResponder(textView)
                 statusLine.showMessage("Committed", isError: false)
             }
         } catch {
+            logger.error("Panel", error: error, context: "commit snapshot failed")
             statusLine.showMessage(error.localizedDescription)
         }
     }
 
     private func cancel() {
+        logger.info("Panel", "cancel requested; original field will not be modified")
         window?.orderOut(nil)
         commitCoordinator.cancel()
+        lastLoggedMode = nil
         Task { @MainActor [viewModel] in await viewModel.reset() }
     }
 
