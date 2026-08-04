@@ -19,6 +19,12 @@ public struct PasteboardArchive: Sendable {
     }
 }
 
+@MainActor
+public protocol IntentionalClipboardWriting: AnyObject {
+    @discardableResult
+    func writeTextIntentionally(_ text: String) -> Bool
+}
+
 /// Owns user-visible clipboard operations caused by Vim editing commands.
 /// Temporary clipboard use for AX fallback deliberately goes through separate APIs.
 public final class SystemClipboardService: @unchecked Sendable {
@@ -43,16 +49,26 @@ public final class SystemClipboardService: @unchecked Sendable {
         return text
     }
 
-    public func writeTextIntentionally(_ text: String) {
+    @discardableResult
+    public func writeTextIntentionally(_ text: String) -> Bool {
         onMain {
             self.intentionalRevisionStorage &+= 1
             self.pasteboard.clearContents()
-            self.pasteboard.setString(text, forType: .string)
-            self.logger.info(
-                "Clipboard",
-                "intentional write utf16Length=\(text.utf16.count) "
-                    + "revision=\(self.intentionalRevisionStorage)"
-            )
+            let didWrite = self.pasteboard.setString(text, forType: .string)
+            if didWrite {
+                self.logger.info(
+                    "Clipboard",
+                    "intentional write utf16Length=\(text.utf16.count) "
+                        + "revision=\(self.intentionalRevisionStorage)"
+                )
+            } else {
+                self.logger.error(
+                    "Clipboard",
+                    "intentional write failed utf16Length=\(text.utf16.count) "
+                        + "revision=\(self.intentionalRevisionStorage)"
+                )
+            }
+            return didWrite
         }
     }
 
@@ -180,3 +196,5 @@ public final class SystemClipboardService: @unchecked Sendable {
         return DispatchQueue.main.sync(execute: operation)
     }
 }
+
+extension SystemClipboardService: IntentionalClipboardWriting {}

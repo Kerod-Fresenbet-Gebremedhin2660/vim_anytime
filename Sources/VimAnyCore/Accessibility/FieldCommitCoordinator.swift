@@ -3,6 +3,7 @@ import Foundation
 public enum FieldCommitResult: Equatable, Sendable {
     case direct
     case clipboardFallback
+    case copiedToClipboard
     case failed
 }
 
@@ -12,14 +13,17 @@ public final class FieldCommitCoordinator {
     private let logger = DiagnosticLogger.shared
     private let accessibility: AccessibilityTextServicing
     private let fallback: ClipboardFallbackWriting
+    private let clipboard: IntentionalClipboardWriting
     public private(set) var capturedField: CapturedTextField?
 
     public init(
         accessibility: AccessibilityTextServicing,
-        fallback: ClipboardFallbackWriting
+        fallback: ClipboardFallbackWriting,
+        clipboard: IntentionalClipboardWriting
     ) {
         self.accessibility = accessibility
         self.fallback = fallback
+        self.clipboard = clipboard
     }
 
     @discardableResult
@@ -38,7 +42,8 @@ public final class FieldCommitCoordinator {
     public func commit(
         text: String,
         selectionRange: NSRange,
-        restoreFocus: Bool
+        restoreFocus: Bool,
+        copyTextToClipboardOnFailure: Bool = false
     ) async -> FieldCommitResult {
         guard let capturedField else {
             logger.error("Commit", "commit requested without a captured field")
@@ -48,26 +53,84 @@ public final class FieldCommitCoordinator {
             "Commit",
             "commit started pid=\(capturedField.target.processIdentifier) "
                 + "utf16Length=\(text.utf16.count) selection=\(NSStringFromRange(selectionRange)) "
-                + "restoreFocus=\(restoreFocus)"
+                + "restoreFocus=\(restoreFocus) "
+                + "copyOnFailure=\(copyTextToClipboardOnFailure)"
         )
 
         if accessibility.write(text: text, selectionRange: selectionRange, to: capturedField.target) {
-            if restoreFocus { accessibility.restoreFocus(to: capturedField.target) }
-            logger.info("Commit", "commit completed strategy=directAX")
-            return .direct
+            if verifyWrittenText(text, in: capturedField.target, strategy: "directAX") {
+                if restoreFocus { accessibility.restoreFocus(to: capturedField.target) }
+                logger.info("Commit", "commit completed strategy=directAX")
+                return .direct
+            }
+            logger.warning(
+                "Commit",
+                "direct AX write reported success but read-back verification failed"
+            )
+        } else {
+            logger.warning("Commit", "direct AX write rejected")
         }
 
-        logger.warning("Commit", "direct AX write rejected; starting clipboard fallback")
+        logger.warning("Commit", "starting clipboard fallback")
         let didPaste = await fallback.replace(text: text, target: capturedField.target) { [accessibility] in
             accessibility.restoreFocus(to: capturedField.target)
         }
-        if didPaste {
+        if didPaste,
+           verifyWrittenText(text, in: capturedField.target, strategy: "clipboardFallback") {
             accessibility.writeSelection(selectionRange, to: capturedField.target)
             logger.info("Commit", "commit completed strategy=clipboardFallback")
             return .clipboardFallback
         }
-        logger.error("Commit", "clipboard fallback failed")
+        if didPaste {
+            logger.error(
+                "Commit",
+                "clipboard fallback posted paste but read-back verification failed"
+            )
+        } else {
+            logger.error("Commit", "clipboard fallback could not post paste")
+        }
+        if copyTextToClipboardOnFailure {
+            if clipboard.writeTextIntentionally(text) {
+                logger.warning(
+                    "Commit",
+                    "field write failed; edited text copied intentionally to clipboard "
+                        + "utf16Length=\(text.utf16.count)"
+                )
+                return .copiedToClipboard
+            }
+            logger.error("Commit", "last-resort edited-text clipboard write failed")
+        }
         return .failed
+    }
+
+    private func verifyWrittenText(
+        _ expectedText: String,
+        in target: AccessibilityTextTarget,
+        strategy: String
+    ) -> Bool {
+        guard let actualText = accessibility.readText(from: target) else {
+            logger.warning(
+                "Commit",
+                "write verification unavailable strategy=\(strategy) "
+                    + "expectedUTF16Length=\(expectedText.utf16.count)"
+            )
+            return false
+        }
+        guard actualText == expectedText else {
+            logger.warning(
+                "Commit",
+                "write verification mismatch strategy=\(strategy) "
+                    + "expectedUTF16Length=\(expectedText.utf16.count) "
+                    + "actualUTF16Length=\(actualText.utf16.count)"
+            )
+            return false
+        }
+        logger.debug(
+            "Commit",
+            "write verification succeeded strategy=\(strategy) "
+                + "utf16Length=\(expectedText.utf16.count)"
+        )
+        return true
     }
 
     public func cancel() {

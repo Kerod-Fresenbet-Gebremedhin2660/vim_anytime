@@ -52,7 +52,8 @@ final class VimTextView: NSTextView, NSTextViewDelegate {
         isAutomaticDashSubstitutionEnabled = false
         isAutomaticTextReplacementEnabled = false
         isAutomaticSpellingCorrectionEnabled = false
-        isContinuousSpellCheckingEnabled = false
+        isContinuousSpellCheckingEnabled = true
+        isGrammarCheckingEnabled = false
         usesFindPanel = false
         drawsBackground = false
         backgroundColor = .clear
@@ -68,8 +69,31 @@ final class VimTextView: NSTextView, NSTextViewDelegate {
             "configured textStorageAvailable=\(textStorage != nil) "
                 + "layoutManagerAvailable=\(layoutManager != nil) "
                 + "textContainerAvailable=\(textContainer != nil) "
-                + "font=\(editorFont.fontName) pointSize=\(editorFont.pointSize)"
+                + "font=\(editorFont.fontName) pointSize=\(editorFont.pointSize) "
+                + "spellChecking=\(isContinuousSpellCheckingEnabled) "
+                + "automaticCorrection=\(isAutomaticSpellingCorrectionEnabled)"
         )
+    }
+
+    override func validateUserInterfaceItem(
+        _ item: any NSValidatedUserInterfaceItem
+    ) -> Bool {
+        // AppKit's spelling replacement would mutate NSTextStorage directly,
+        // bypassing Neovim's undo tree and dot-repeat state. Keep native
+        // underlines and dictionary actions, but do not enable replacement
+        // until it can be routed through NvimEditingEngine as a structured edit.
+        if item.action == #selector(changeSpelling(_:)) {
+            return false
+        }
+        return super.validateUserInterfaceItem(item)
+    }
+
+    override func changeSpelling(_ sender: Any?) {
+        logger.warning(
+            "TextView",
+            "native spelling replacement ignored to preserve Neovim state"
+        )
+        NSSound.beep()
     }
 
     override func draw(_ dirtyRect: NSRect) {

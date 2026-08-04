@@ -23,7 +23,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let fallback = ClipboardFallbackService(clipboard: clipboard)
         let commitCoordinator = FieldCommitCoordinator(
             accessibility: accessibility,
-            fallback: fallback
+            fallback: fallback,
+            clipboard: clipboard
         )
         let host = NvimHost(clipboard: clipboard)
         let viewModel = EditorViewModel(engine: host)

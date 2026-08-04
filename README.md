@@ -79,6 +79,12 @@ Set `VIMANY_LOG_PATH` to an absolute path before launch to override the destinat
 - `⌘Return` commits and closes.
 - `⌘S` commits without closing.
 - `⌘.` cancels without writing.
+- If commit-and-close cannot write to the original field through either AX or
+  paste fallback, the edited text is copied to the macOS clipboard before the
+  panel closes. A failed `⌘S` keeps the panel open instead.
+- Native spell checking underlines likely misspellings without changing the
+  buffer. Automatic correction and direct AppKit spelling replacements remain
+  disabled so Neovim's undo history and dot-repeat stay authoritative.
 - Vim yanks, deletes, changes, `p`, and `P` use the macOS clipboard.
 - `:w`, `:wq`, `:x`, `:q`, `:q!`, `:undo`, `:redo`, and `:nohlsearch` form the intentionally small Ex whitelist. Other Ex commands are rejected in the native status line. Shell commands are never passed to Neovim.
 

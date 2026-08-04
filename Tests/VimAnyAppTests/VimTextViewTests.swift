@@ -5,6 +5,31 @@ import XCTest
 
 @MainActor
 final class VimTextViewTests: XCTestCase {
+    func testSpellCheckingIsVisualOnlyAndCannotBypassNeovim() {
+        let textView = VimTextView(frame: NSRect(x: 0, y: 0, width: 500, height: 200))
+        let spellingReplacement = NSMenuItem(
+            title: "replacement",
+            action: #selector(NSTextView.changeSpelling(_:)),
+            keyEquivalent: ""
+        )
+
+        XCTAssertTrue(textView.isContinuousSpellCheckingEnabled)
+        XCTAssertFalse(textView.isAutomaticSpellingCorrectionEnabled)
+        XCTAssertFalse(textView.isAutomaticTextReplacementEnabled)
+        XCTAssertFalse(textView.isGrammarCheckingEnabled)
+        XCTAssertFalse(textView.validateUserInterfaceItem(spellingReplacement))
+
+        let snapshot = EditorSnapshot(
+            text: "A deliberatly misspeled sentence.",
+            cursor: TextPosition(line: 0, utf8Column: 0),
+            selection: nil,
+            mode: .normal
+        )
+        textView.apply(snapshot: snapshot)
+        textView.checkTextInDocument(nil)
+        XCTAssertEqual(textView.string, snapshot.text)
+    }
+
     func testAttributedInputCannotReplaceEditorFontOrCorruptUnicode() {
         let textView = VimTextView(frame: NSRect(x: 0, y: 0, width: 500, height: 200))
         textView.currentMode = .insert

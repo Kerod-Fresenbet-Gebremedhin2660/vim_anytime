@@ -224,7 +224,8 @@ final class EditorPanelController: NSWindowController {
             let result = await commitCoordinator.commit(
                 text: snapshot.text,
                 selectionRange: selectionRange,
-                restoreFocus: close
+                restoreFocus: close,
+                copyTextToClipboardOnFailure: close
             )
             guard result != .failed else {
                 logger.error("Panel", "commit failed for all write strategies")
@@ -238,7 +239,17 @@ final class EditorPanelController: NSWindowController {
             }
 
             if close {
-                logger.info("Panel", "commit succeeded strategy=\(String(describing: result)); closing")
+                if result == .copiedToClipboard {
+                    logger.warning(
+                        "Panel",
+                        "original field write failed; edited text is on clipboard; closing"
+                    )
+                } else {
+                    logger.info(
+                        "Panel",
+                        "commit succeeded strategy=\(String(describing: result)); closing"
+                    )
+                }
                 commitCoordinator.finish()
                 await viewModel.reset()
             } else {

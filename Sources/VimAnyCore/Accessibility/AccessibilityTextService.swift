@@ -69,6 +69,7 @@ public struct CapturedTextField {
 @MainActor
 public protocol AccessibilityTextServicing: AnyObject {
     func captureFocusedTextField() throws -> CapturedTextField
+    func readText(from target: AccessibilityTextTarget) -> String?
     func write(text: String, selectionRange: NSRange, to target: AccessibilityTextTarget) -> Bool
     func writeSelection(_ selectionRange: NSRange, to target: AccessibilityTextTarget)
     func restoreFocus(to target: AccessibilityTextTarget)
@@ -170,6 +171,25 @@ public final class AccessibilityTextService: AccessibilityTextServicing {
         )
         writeSelection(selectionRange, to: target)
         return true
+    }
+
+    public func readText(from target: AccessibilityTextTarget) -> String? {
+        guard let text = copyAttribute(
+            kAXValueAttribute as CFString,
+            from: target.textElement
+        ) as? String else {
+            logger.warning(
+                "Accessibility",
+                "target value verification unavailable pid=\(target.processIdentifier)"
+            )
+            return nil
+        }
+        logger.debug(
+            "Accessibility",
+            "target value verification read pid=\(target.processIdentifier) "
+                + "utf16Length=\(text.utf16.count)"
+        )
+        return text
     }
 
     public func writeSelection(_ selectionRange: NSRange, to target: AccessibilityTextTarget) {
