@@ -36,6 +36,10 @@ let package = Package(
             name: "VimAnyIntegrationTests",
             dependencies: ["VimAnyCore"]
         ),
+        .testTarget(
+            name: "VimAnyAppTests",
+            dependencies: ["VimAnyApp", "VimAnyCore"]
+        ),
     ],
     swiftLanguageModes: [.v5]
 )

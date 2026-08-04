@@ -15,6 +15,15 @@ final class VimTextView: NSTextView, NSTextViewDelegate {
     private var deferredSnapshot: EditorSnapshot?
     private var cursorUTF16Offset = 0
     private var isConfigured = false
+    private var lastReplacementCharacterCount = 0
+    private let editorFont = NSFont.monospacedSystemFont(ofSize: 15, weight: .regular)
+
+    private var editorTextAttributes: [NSAttributedString.Key: Any] {
+        [
+            .font: editorFont,
+            .foregroundColor: NSColor.textColor,
+        ]
+    }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -49,7 +58,8 @@ final class VimTextView: NSTextView, NSTextViewDelegate {
         backgroundColor = .clear
         textColor = .textColor
         insertionPointColor = .controlAccentColor
-        font = NSFont.monospacedSystemFont(ofSize: 15, weight: .regular)
+        font = editorFont
+        typingAttributes = editorTextAttributes
         textContainerInset = NSSize(width: 16, height: 14)
         textContainer?.widthTracksTextView = true
         textContainer?.lineFragmentPadding = 0
@@ -57,7 +67,8 @@ final class VimTextView: NSTextView, NSTextViewDelegate {
             "TextView",
             "configured textStorageAvailable=\(textStorage != nil) "
                 + "layoutManagerAvailable=\(layoutManager != nil) "
-                + "textContainerAvailable=\(textContainer != nil)"
+                + "textContainerAvailable=\(textContainer != nil) "
+                + "font=\(editorFont.fontName) pointSize=\(editorFont.pointSize)"
         )
     }
 
@@ -131,24 +142,39 @@ final class VimTextView: NSTextView, NSTextViewDelegate {
 
     override func insertText(_ insertString: Any, replacementRange: NSRange) {
         let text: String
+        let inputKind: String
         if let attributed = insertString as? NSAttributedString {
             text = attributed.string
+            inputKind = "attributed"
         } else if let string = insertString as? String {
             text = string
+            inputKind = "plain"
         } else {
             text = String(describing: insertString)
+            inputKind = "other"
         }
 
         // Keep the AppKit surface responsive while Neovim remains authoritative.
-        // Calling `super` also lets NSTextView finish marked-text/IME composition;
-        // the following Neovim snapshot reconciles replace-mode and other semantics.
+        // AppKit input methods may commit an attributed string containing a font
+        // intended only for their candidate UI. Insert its plain text with our
+        // stable typing attributes so those foreign attributes cannot render as
+        // missing-glyph boxes. Neovim remains authoritative and the following
+        // snapshot reconciles replace-mode and other semantics.
+        let insertionLocation = effectiveInsertionLocation(for: replacementRange)
         isFinalizingMarkedText = true
-        super.insertText(insertString, replacementRange: replacementRange)
+        typingAttributes = editorTextAttributes
+        super.insertText(text, replacementRange: replacementRange)
+        applyEditorAttributes(
+            to: NSRange(location: insertionLocation, length: text.utf16.count)
+        )
+        typingAttributes = editorTextAttributes
         isFinalizingMarkedText = false
         logger.debug(
             "TextView",
             "committed native text utf16Length=\(text.utf16.count) "
-                + "replacementRange=\(NSStringFromRange(replacementRange))"
+                + "replacementRange=\(NSStringFromRange(replacementRange)) "
+                + "inputKind=\(inputKind) "
+                + "replacementCharacters=\(Self.replacementCharacterCount(in: text))"
         )
         onCommittedText?(text)
 
@@ -195,15 +221,26 @@ final class VimTextView: NSTextView, NSTextViewDelegate {
 
         let textChanged = string != snapshot.text
         if textChanged {
-            let attributes: [NSAttributedString.Key: Any] = [
-                .font: font ?? NSFont.monospacedSystemFont(ofSize: 15, weight: .regular),
-                .foregroundColor: NSColor.textColor,
-            ]
             guard let textStorage else {
                 logger.error("TextView", "cannot render snapshot because NSTextStorage is missing")
                 return nil
             }
-            textStorage.setAttributedString(NSAttributedString(string: snapshot.text, attributes: attributes))
+            textStorage.setAttributedString(
+                NSAttributedString(string: snapshot.text, attributes: editorTextAttributes)
+            )
+        }
+        typingAttributes = editorTextAttributes
+
+        let replacementCharacterCount = Self.replacementCharacterCount(in: snapshot.text)
+        if replacementCharacterCount != lastReplacementCharacterCount {
+            lastReplacementCharacterCount = replacementCharacterCount
+            if replacementCharacterCount > 0 {
+                logger.warning(
+                    "TextView",
+                    "snapshot contains Unicode replacement characters "
+                        + "count=\(replacementCharacterCount)"
+                )
+            }
         }
 
         let requestedRange: NSRange
@@ -234,6 +271,32 @@ final class VimTextView: NSTextView, NSTextViewDelegate {
                 + "cursorOffset=\(cursorUTF16Offset) frame=\(NSStringFromRect(frame))"
         )
         return textChanged
+    }
+
+    private func effectiveInsertionLocation(for replacementRange: NSRange) -> Int {
+        let textLength = (string as NSString).length
+        let requestedLocation = replacementRange.location == NSNotFound
+            ? selectedRange().location
+            : replacementRange.location
+        return min(max(0, requestedLocation), textLength)
+    }
+
+    private func applyEditorAttributes(to requestedRange: NSRange) {
+        guard requestedRange.length > 0, let textStorage else { return }
+        let storageLength = textStorage.length
+        let location = min(max(0, requestedRange.location), storageLength)
+        let length = min(max(0, requestedRange.length), storageLength - location)
+        guard length > 0 else { return }
+        textStorage.addAttributes(
+            editorTextAttributes,
+            range: NSRange(location: location, length: length)
+        )
+    }
+
+    private static func replacementCharacterCount(in text: String) -> Int {
+        text.unicodeScalars.reduce(into: 0) { count, scalar in
+            if scalar.value == 0xFFFD { count += 1 }
+        }
     }
 
     private func blockCursorRect() -> NSRect? {
