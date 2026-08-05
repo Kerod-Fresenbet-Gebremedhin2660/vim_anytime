@@ -119,8 +119,9 @@ struct AccessibilityTextContentAdapter {
 
     /// Builds edits for only the plain-text gaps around Cursor reference
     /// nodes. The references must still exist, unmodified, and in their
-    /// original order; otherwise a text-only client cannot safely preserve
-    /// their identity and the caller must fail without replacing the field.
+    /// original order. Cursor may add or remove boundary presentation text as
+    /// focus changes, so the current AX value—not the captured gaps—is the
+    /// coordinate source for every replacement.
     func referencePreservingCommitPlan(
         currentAccessibilityText: String,
         editedText: String,
@@ -132,8 +133,7 @@ struct AccessibilityTextContentAdapter {
             currentAccessibilityText,
             selectionRange: NSRange(location: 0, length: 0)
         )
-        guard current.text == editableText,
-              current.references.map(\.editableToken) == capturedReferences.map(\.editableToken),
+        guard current.references.map(\.editableToken) == capturedReferences.map(\.editableToken),
               let editedReferenceRanges = CursorReferenceCodec.orderedReferenceRanges(
                   in: editedText,
                   references: current.references

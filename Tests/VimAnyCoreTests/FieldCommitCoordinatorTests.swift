@@ -159,6 +159,45 @@ final class FieldCommitCoordinatorTests: XCTestCase {
         XCTAssertEqual(clipboard.lastText, editedText)
     }
 
+    func testCursorReferencePlanReadsRangesAfterRestoringSourceFocus() async throws {
+        let accessibility = MockAccessibilityService()
+        let rawReference = "\u{E07D}\nExchangeRateSwapCard.tsx\n\u{EA76}"
+        accessibility.capturedText = "\n\(rawReference)\n"
+        accessibility.capturedApplicationName = "Cursor"
+        accessibility.useApplicationContentAdapter = true
+        accessibility.currentText = rawReference
+        accessibility.onRestoreFocus = {
+            accessibility.currentText = accessibility.capturedText
+        }
+        let fallback = MockFallbackWriter()
+        fallback.onSuccessfulRangeReplace = { replacements in
+            accessibility.currentText = Self.applying(
+                replacements,
+                to: accessibility.currentText
+            )
+        }
+        let coordinator = FieldCommitCoordinator(
+            accessibility: accessibility,
+            fallback: fallback,
+            clipboard: MockClipboardWriter()
+        )
+        let capture = try coordinator.begin()
+        let editedText = capture.text + "Explain this"
+
+        let result = await coordinator.commit(
+            text: editedText,
+            selectionRange: NSRange(location: editedText.utf16.count, length: 0),
+            restoreFocus: true
+        )
+
+        XCTAssertEqual(result, .referencePreserving)
+        XCTAssertGreaterThanOrEqual(accessibility.focusCalls, 1)
+        XCTAssertEqual(
+            accessibility.currentText,
+            "\n\(rawReference)\nExplain this"
+        )
+    }
+
     func testRejectedAXWriteUsesClipboardFallbackAndFocusesTarget() async throws {
         let accessibility = MockAccessibilityService()
         accessibility.writeResult = false
@@ -371,6 +410,7 @@ private final class MockAccessibilityService: AccessibilityTextServicing {
     var capturedSelectionRange = NSRange(location: 2, length: 0)
     var capturedApplicationName: String? = "Mock"
     var useApplicationContentAdapter = false
+    var onRestoreFocus: (() -> Void)?
 
     func captureFocusedTextField() throws -> CapturedTextField {
         if useApplicationContentAdapter {
@@ -412,6 +452,7 @@ private final class MockAccessibilityService: AccessibilityTextServicing {
 
     func restoreFocus(to target: AccessibilityTextTarget) {
         focusCalls += 1
+        onRestoreFocus?()
     }
 }
 

@@ -62,7 +62,6 @@ public final class FieldCommitCoordinator {
             return await commitPreservingReferences(
                 text: text,
                 selectionRange: selectionRange,
-                restoreFocus: restoreFocus,
                 copyTextToClipboardOnFailure: copyTextToClipboardOnFailure,
                 capturedField: capturedField
             )
@@ -135,11 +134,16 @@ public final class FieldCommitCoordinator {
     private func commitPreservingReferences(
         text: String,
         selectionRange: NSRange,
-        restoreFocus: Bool,
         copyTextToClipboardOnFailure: Bool,
         capturedField: CapturedTextField
     ) async -> FieldCommitResult {
         logger.info("Commit", "structured reference preservation strategy selected")
+        // Cursor changes the AXValue boundary representation when its prompt
+        // gains or loses focus. Focus first, then read and edit in one stable
+        // coordinate space; planning while VimAny owns focus produces ranges
+        // that are already stale by the time synthetic paste is delivered.
+        accessibility.restoreFocus(to: capturedField.target)
+        try? await Task.sleep(nanoseconds: 80_000_000)
         guard let currentAccessibilityText = accessibility.readText(from: capturedField.target),
               let plan = capturedField.contentAdapter.referencePreservingCommitPlan(
                   currentAccessibilityText: currentAccessibilityText,
@@ -148,7 +152,7 @@ public final class FieldCommitCoordinator {
               ) else {
             logger.error(
                 "Commit",
-                "structured references changed or source field changed; destructive replacement skipped"
+                "structured references changed or are unavailable; destructive replacement skipped"
             )
             return copyOrFail(
                 text: text,
@@ -157,7 +161,6 @@ public final class FieldCommitCoordinator {
         }
 
         if plan.replacements.isEmpty {
-            if restoreFocus { accessibility.restoreFocus(to: capturedField.target) }
             accessibility.writeSelection(plan.finalSelectionRange, to: capturedField.target)
             logger.info("Commit", "structured reference commit completed without text changes")
             return .referencePreserving

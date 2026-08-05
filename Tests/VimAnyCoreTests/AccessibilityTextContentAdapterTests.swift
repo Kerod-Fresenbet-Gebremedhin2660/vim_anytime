@@ -140,6 +140,35 @@ final class AccessibilityTextContentAdapterTests: XCTestCase {
         XCTAssertNil(plan)
     }
 
+    func testReferencePlanUsesCurrentRangesWhenCursorDropsFocusPresentationText() {
+        let rawReference = "\(fileIcon)\n\(filename)\n\(closeIcon)"
+        let capturedText = "\n\(rawReference)\n"
+        let currentUnfocusedText = rawReference
+        let adapter = AccessibilityTextContentAdapter.make(
+            accessibilityText: capturedText,
+            selectionRange: NSRange(location: 0, length: 0),
+            applicationName: "Cursor"
+        )
+        let editedText = "\n@\(filename)\nExplain this"
+
+        let plan = adapter.referencePreservingCommitPlan(
+            currentAccessibilityText: currentUnfocusedText,
+            editedText: editedText,
+            selectionRange: NSRange(location: editedText.utf16.count, length: 0)
+        )
+
+        XCTAssertEqual(plan?.replacements.count, 2)
+        XCTAssertEqual(plan?.replacements.map(\.range), [
+            NSRange(location: currentUnfocusedText.utf16.count, length: 0),
+            NSRange(location: 0, length: 0),
+        ])
+        XCTAssertEqual(plan?.replacements.map(\.text), ["\nExplain this", "\n"])
+        XCTAssertEqual(
+            plan?.expectedAccessibilityText,
+            "\n\(rawReference)\nExplain this"
+        )
+    }
+
     func testPrivateUseTextOutsideCursorIsLeftUntouched() {
         let rawText = "\(fileIcon)\n\(filename)\n\(closeIcon)"
 
