@@ -2,6 +2,7 @@ import Foundation
 
 public enum FieldCommitResult: Equatable, Sendable {
     case direct
+    case referencePreserving
     case clipboardFallback
     case copiedToClipboard
     case failed
@@ -57,8 +58,31 @@ public final class FieldCommitCoordinator {
                 + "copyOnFailure=\(copyTextToClipboardOnFailure)"
         )
 
-        if accessibility.write(text: text, selectionRange: selectionRange, to: capturedField.target) {
-            if verifyWrittenText(text, in: capturedField.target, strategy: "directAX") {
+        if capturedField.contentAdapter.requiresReferencePreservingCommit {
+            return await commitPreservingReferences(
+                text: text,
+                selectionRange: selectionRange,
+                restoreFocus: restoreFocus,
+                copyTextToClipboardOnFailure: copyTextToClipboardOnFailure,
+                capturedField: capturedField
+            )
+        }
+
+        let directPayload = capturedField.contentAdapter.directWritePayload(
+            editableText: text,
+            selectionRange: selectionRange
+        )
+        if accessibility.write(
+            text: directPayload.text,
+            selectionRange: directPayload.selectionRange,
+            to: capturedField.target
+        ) {
+            if verifyWrittenText(
+                text,
+                selectionRange: selectionRange,
+                in: capturedField,
+                strategy: "directAX"
+            ) != nil {
                 if restoreFocus { accessibility.restoreFocus(to: capturedField.target) }
                 logger.info("Commit", "commit completed strategy=directAX")
                 return .direct
@@ -76,8 +100,13 @@ public final class FieldCommitCoordinator {
             accessibility.restoreFocus(to: capturedField.target)
         }
         if didPaste,
-           verifyWrittenText(text, in: capturedField.target, strategy: "clipboardFallback") {
-            accessibility.writeSelection(selectionRange, to: capturedField.target)
+           let verifiedSelectionRange = verifyWrittenText(
+               text,
+               selectionRange: selectionRange,
+               in: capturedField,
+               strategy: "clipboardFallback"
+           ) {
+            accessibility.writeSelection(verifiedSelectionRange, to: capturedField.target)
             logger.info("Commit", "commit completed strategy=clipboardFallback")
             return .clipboardFallback
         }
@@ -103,34 +132,120 @@ public final class FieldCommitCoordinator {
         return .failed
     }
 
+    private func commitPreservingReferences(
+        text: String,
+        selectionRange: NSRange,
+        restoreFocus: Bool,
+        copyTextToClipboardOnFailure: Bool,
+        capturedField: CapturedTextField
+    ) async -> FieldCommitResult {
+        logger.info("Commit", "structured reference preservation strategy selected")
+        guard let currentAccessibilityText = accessibility.readText(from: capturedField.target),
+              let plan = capturedField.contentAdapter.referencePreservingCommitPlan(
+                  currentAccessibilityText: currentAccessibilityText,
+                  editedText: text,
+                  selectionRange: selectionRange
+              ) else {
+            logger.error(
+                "Commit",
+                "structured references changed or source field changed; destructive replacement skipped"
+            )
+            return copyOrFail(
+                text: text,
+                copyTextToClipboardOnFailure: copyTextToClipboardOnFailure
+            )
+        }
+
+        if plan.replacements.isEmpty {
+            if restoreFocus { accessibility.restoreFocus(to: capturedField.target) }
+            accessibility.writeSelection(plan.finalSelectionRange, to: capturedField.target)
+            logger.info("Commit", "structured reference commit completed without text changes")
+            return .referencePreserving
+        }
+
+        let didReplace = await fallback.replaceRanges(
+            plan.replacements,
+            target: capturedField.target
+        ) { [accessibility] in
+            accessibility.restoreFocus(to: capturedField.target)
+        }
+        let verifiedSelectionRange = verifyWrittenText(
+            text,
+            selectionRange: selectionRange,
+            in: capturedField,
+            strategy: "referencePreservingRanges"
+        )
+        if let verifiedSelectionRange {
+            accessibility.writeSelection(verifiedSelectionRange, to: capturedField.target)
+            logger.info(
+                "Commit",
+                "structured reference commit completed operationCount=\(plan.replacements.count) "
+                    + "eventsReportedSuccess=\(didReplace)"
+            )
+            return .referencePreserving
+        }
+
+        logger.error(
+            "Commit",
+            "structured reference range commit failed verification; whole-field fallback skipped"
+        )
+        return copyOrFail(
+            text: text,
+            copyTextToClipboardOnFailure: copyTextToClipboardOnFailure
+        )
+    }
+
+    private func copyOrFail(
+        text: String,
+        copyTextToClipboardOnFailure: Bool
+    ) -> FieldCommitResult {
+        guard copyTextToClipboardOnFailure else { return .failed }
+        if clipboard.writeTextIntentionally(text) {
+            logger.warning(
+                "Commit",
+                "edited text copied intentionally because a safe field write was unavailable "
+                    + "utf16Length=\(text.utf16.count)"
+            )
+            return .copiedToClipboard
+        }
+        logger.error("Commit", "last-resort edited-text clipboard write failed")
+        return .failed
+    }
+
     private func verifyWrittenText(
         _ expectedText: String,
-        in target: AccessibilityTextTarget,
+        selectionRange: NSRange,
+        in capturedField: CapturedTextField,
         strategy: String
-    ) -> Bool {
-        guard let actualText = accessibility.readText(from: target) else {
+    ) -> NSRange? {
+        guard let actualText = accessibility.readText(from: capturedField.target) else {
             logger.warning(
                 "Commit",
                 "write verification unavailable strategy=\(strategy) "
                     + "expectedUTF16Length=\(expectedText.utf16.count)"
             )
-            return false
+            return nil
         }
-        guard actualText == expectedText else {
+        let normalizedText = capturedField.contentAdapter.normalizeReadBack(actualText)
+        guard normalizedText == expectedText else {
             logger.warning(
                 "Commit",
                 "write verification mismatch strategy=\(strategy) "
                     + "expectedUTF16Length=\(expectedText.utf16.count) "
                     + "actualUTF16Length=\(actualText.utf16.count)"
             )
-            return false
+            return nil
         }
         logger.debug(
             "Commit",
             "write verification succeeded strategy=\(strategy) "
                 + "utf16Length=\(expectedText.utf16.count)"
         )
-        return true
+        return capturedField.contentAdapter.selectionRange(
+            inReadBack: actualText,
+            editableText: expectedText,
+            editableSelectionRange: selectionRange
+        )
     }
 
     public func cancel() {

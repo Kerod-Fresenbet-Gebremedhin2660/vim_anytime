@@ -23,8 +23,8 @@ public enum AccessibilityTextError: Error, LocalizedError {
 }
 
 public final class AccessibilityTextTarget {
-    fileprivate let applicationElement: AXUIElement
-    fileprivate let textElement: AXUIElement
+    let applicationElement: AXUIElement
+    let textElement: AXUIElement
     public let processIdentifier: pid_t
 
     init(applicationElement: AXUIElement, textElement: AXUIElement, processIdentifier: pid_t) {
@@ -48,6 +48,7 @@ public struct CapturedTextField {
     public let selectionRange: NSRange
     public let target: AccessibilityTextTarget
     public let applicationName: String?
+    let contentAdapter: AccessibilityTextContentAdapter
 
     public init(
         text: String,
@@ -59,6 +60,19 @@ public struct CapturedTextField {
         self.selectionRange = selectionRange
         self.target = target
         self.applicationName = applicationName
+        contentAdapter = .identity(text: text, selectionRange: selectionRange)
+    }
+
+    init(
+        contentAdapter: AccessibilityTextContentAdapter,
+        target: AccessibilityTextTarget,
+        applicationName: String?
+    ) {
+        text = contentAdapter.editableText
+        selectionRange = contentAdapter.editableSelectionRange
+        self.target = target
+        self.applicationName = applicationName
+        self.contentAdapter = contentAdapter
     }
 
     public var editorSelection: EditorSelection {
@@ -128,6 +142,11 @@ public final class AccessibilityTextService: AccessibilityTextServicing {
         let selectedRange = copyRangeAttribute(kAXSelectedTextRangeAttribute as CFString, from: element)
             ?? NSRange(location: text.utf16.count, length: 0)
         let applicationName = NSRunningApplication(processIdentifier: processIdentifier)?.localizedName
+        let contentAdapter = AccessibilityTextContentAdapter.make(
+            accessibilityText: text,
+            selectionRange: selectedRange,
+            applicationName: applicationName
+        )
         let target = AccessibilityTextTarget(
             applicationElement: application,
             textElement: element,
@@ -136,11 +155,13 @@ public final class AccessibilityTextService: AccessibilityTextServicing {
         logger.info(
             "Accessibility",
             "capture succeeded app=\(applicationName ?? "unknown") pid=\(processIdentifier) "
-                + "utf16Length=\(text.utf16.count) selection=\(NSStringFromRange(selectedRange))"
+                + "axUTF16Length=\(text.utf16.count) "
+                + "editorUTF16Length=\(contentAdapter.editableText.utf16.count) "
+                + "selection=\(NSStringFromRange(contentAdapter.editableSelectionRange)) "
+                + "adaptedReferences=\(contentAdapter.adaptedReferenceCount)"
         )
         return CapturedTextField(
-            text: text,
-            selectionRange: selectedRange,
+            contentAdapter: contentAdapter,
             target: target,
             applicationName: applicationName
         )

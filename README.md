@@ -85,6 +85,11 @@ Set `VIMANY_LOG_PATH` to an absolute path before launch to override the destinat
 - Native spell checking underlines likely misspellings without changing the
   buffer. Automatic correction and direct AppKit spelling replacements remain
   disabled so Neovim's undo history and dot-repeat stay authoritative.
+- Cursor `@file` references are shown as readable `@filename` text instead of
+  Cursor's private-use file and close icons. Commits replace only the editable
+  text gaps around unchanged references, leaving Cursor's rich reference nodes
+  in place. If a reference token itself is changed or reordered, VimAny refuses
+  a destructive whole-field replacement and uses the normal safe-failure path.
 - Vim yanks, deletes, changes, `p`, and `P` use the macOS clipboard.
 - `:w`, `:wq`, `:x`, `:q`, `:q!`, `:undo`, `:redo`, and `:nohlsearch` form the intentionally small Ex whitelist. Other Ex commands are rejected in the native status line. Shell commands are never passed to Neovim.
 

@@ -17,6 +17,7 @@ stdin and stdout carry MessagePack-RPC. There is no terminal, PTY, terminal-grid
 ```text
 Carbon global shortcut
   → AccessibilityTextService.captureFocusedTextField()
+  → AccessibilityTextContentAdapter removes target-app presentation markers
   → NvimHost.load(text:selection:)
   → EditorPanelController presents VimTextView
   → NSEvent / NSTextInputClient commit
@@ -26,7 +27,7 @@ Carbon global shortcut
   → NSTextView storage, selection, scrolling, and native status bar
 ```
 
-Commit converts the current Neovim byte-based cursor/visual selection into an AppKit UTF-16 range. `AccessibilityTextService` first attempts a direct AX value and selection write. VimAny reads the target value back, and only an exact text match counts as success. If the value write is rejected or verification fails, `ClipboardFallbackService` focuses the captured application, temporarily places the final text on the pasteboard, synthesizes Select All and Paste, then restores a full pasteboard archive only when neither the pasteboard nor the intentional-edit clipboard generation changed during the operation. The paste path is also verified by reading the target field back; successfully posting a keyboard event alone is not considered a successful write.
+Commit converts the current Neovim byte-based cursor/visual selection into an AppKit UTF-16 range. `AccessibilityTextContentAdapter` first converts target-app presentation details into editable plain text and maps the AX selection into that representation. Cursor reference chips exposed as private-use file icon, label, and close icon lines become readable `@label` tokens. When those tokens remain unchanged and ordered, commit constructs descending AX range replacements for only the plain-text gaps around them. `ClipboardFallbackService` selects each gap and uses Cursor's plain-paste path, preserving the original rich reference nodes and restoring the archived clipboard afterward. Whole AX value writes and Select All/Paste are never attempted for a field with adapted references because either operation flattens those nodes. A changed/reordered reference token or concurrently changed source field fails safely instead. For ordinary fields, `AccessibilityTextService` first attempts a direct AX value and selection write, followed by clipboard fallback when needed. Every strategy reads the target value back, normalizes it through the same adapter, and only an exact editable-text match counts as success; successfully posting a keyboard event alone is not considered a successful write.
 
 For commit-and-close, a failure of both field-write strategies becomes an
 intentional clipboard action: after temporary fallback restoration has
@@ -49,6 +50,7 @@ VimAny
 │   └── main
 ├── VimAnyCore
 │   ├── Accessibility
+│   │   ├── AccessibilityTextContentAdapter
 │   │   ├── AccessibilityTextService
 │   │   └── FieldCommitCoordinator
 │   ├── Clipboard

@@ -48,6 +48,117 @@ final class FieldCommitCoordinatorTests: XCTestCase {
         XCTAssertEqual(clipboard.calls, 0)
     }
 
+    func testCursorReferenceCommitEditsOnlyGapsAndNeverReplacesWholeField() async throws {
+        let accessibility = MockAccessibilityService()
+        accessibility.capturedText = "\u{E07D}\nExchangeRateSwapCard.tsx\n\u{EA76}"
+        accessibility.capturedApplicationName = "Cursor"
+        accessibility.useApplicationContentAdapter = true
+        accessibility.currentText = accessibility.capturedText
+        let fallback = MockFallbackWriter()
+        fallback.onSuccessfulRangeReplace = { replacements in
+            accessibility.currentText = Self.applying(
+                replacements,
+                to: accessibility.currentText
+            )
+        }
+        let clipboard = MockClipboardWriter()
+        let coordinator = FieldCommitCoordinator(
+            accessibility: accessibility,
+            fallback: fallback,
+            clipboard: clipboard
+        )
+
+        let capture = try coordinator.begin()
+        XCTAssertEqual(capture.text, "@ExchangeRateSwapCard.tsx")
+        let editedText = "Review @ExchangeRateSwapCard.tsx please"
+        let result = await coordinator.commit(
+            text: editedText,
+            selectionRange: NSRange(location: editedText.utf16.count, length: 0),
+            restoreFocus: true
+        )
+
+        XCTAssertEqual(result, .referencePreserving)
+        XCTAssertEqual(
+            accessibility.currentText,
+            "Review \u{E07D}\nExchangeRateSwapCard.tsx\n\u{EA76} please"
+        )
+        XCTAssertEqual(accessibility.writeCalls, 0)
+        XCTAssertEqual(
+            accessibility.lastSelection?.location,
+            accessibility.currentText.utf16.count
+        )
+        XCTAssertEqual(fallback.calls, 0)
+        XCTAssertEqual(fallback.rangeCalls, 1)
+    }
+
+    func testCursorRangeReplacementTransportsOnlyCleanGapText() async throws {
+        let accessibility = MockAccessibilityService()
+        accessibility.capturedText = "\u{E07D}\nExchangeRateSwapCard.tsx\n\u{EA76}"
+        accessibility.capturedApplicationName = "Cursor"
+        accessibility.useApplicationContentAdapter = true
+        accessibility.currentText = accessibility.capturedText
+        let fallback = MockFallbackWriter()
+        fallback.onSuccessfulRangeReplace = { replacements in
+            accessibility.currentText = Self.applying(
+                replacements,
+                to: accessibility.currentText
+            )
+        }
+        let clipboard = MockClipboardWriter()
+        let coordinator = FieldCommitCoordinator(
+            accessibility: accessibility,
+            fallback: fallback,
+            clipboard: clipboard
+        )
+        try coordinator.begin()
+        let editedText = "Review @ExchangeRateSwapCard.tsx please"
+
+        let result = await coordinator.commit(
+            text: editedText,
+            selectionRange: NSRange(location: editedText.utf16.count, length: 0),
+            restoreFocus: true
+        )
+
+        XCTAssertEqual(result, .referencePreserving)
+        XCTAssertEqual(fallback.calls, 0)
+        XCTAssertEqual(fallback.rangeCalls, 1)
+        XCTAssertEqual(Set(fallback.lastRangeReplacements.map(\.text)), ["Review ", " please"])
+        XCTAssertFalse(fallback.lastRangeReplacements.contains { replacement in
+            replacement.text.contains("\u{E07D}") || replacement.text.contains("\u{EA76}")
+        })
+    }
+
+    func testModifiedCursorReferenceFailsSafelyWithoutFlatteningOriginalField() async throws {
+        let accessibility = MockAccessibilityService()
+        accessibility.capturedText = "\u{E07D}\nExchangeRateSwapCard.tsx\n\u{EA76}"
+        accessibility.capturedApplicationName = "Cursor"
+        accessibility.useApplicationContentAdapter = true
+        accessibility.currentText = accessibility.capturedText
+        let fallback = MockFallbackWriter()
+        let clipboard = MockClipboardWriter()
+        let coordinator = FieldCommitCoordinator(
+            accessibility: accessibility,
+            fallback: fallback,
+            clipboard: clipboard
+        )
+        try coordinator.begin()
+        let editedText = "@ExchangeRateSwapCard.tsxRenamed"
+
+        let result = await coordinator.commit(
+            text: editedText,
+            selectionRange: NSRange(location: editedText.utf16.count, length: 0),
+            restoreFocus: true,
+            copyTextToClipboardOnFailure: true
+        )
+
+        XCTAssertEqual(result, .copiedToClipboard)
+        XCTAssertEqual(accessibility.currentText, accessibility.capturedText)
+        XCTAssertEqual(accessibility.writeCalls, 0)
+        XCTAssertEqual(fallback.calls, 0)
+        XCTAssertEqual(fallback.rangeCalls, 0)
+        XCTAssertEqual(clipboard.lastText, editedText)
+    }
+
     func testRejectedAXWriteUsesClipboardFallbackAndFocusesTarget() async throws {
         let accessibility = MockAccessibilityService()
         accessibility.writeResult = false
@@ -232,6 +343,17 @@ final class FieldCommitCoordinatorTests: XCTestCase {
         XCTAssertEqual(result, .copiedToClipboard)
         XCTAssertEqual(clipboard.readText(), "final edited 😀\ntext")
     }
+
+    private static func applying(
+        _ replacements: [AccessibilityTextReplacement],
+        to text: String
+    ) -> String {
+        let result = NSMutableString(string: text)
+        for replacement in replacements {
+            result.replaceCharacters(in: replacement.range, with: replacement.text)
+        }
+        return result as String
+    }
 }
 
 @MainActor
@@ -245,13 +367,29 @@ private final class MockAccessibilityService: AccessibilityTextServicing {
     var lastSelection: NSRange?
     var currentText = "original"
     var writeAppliesText = true
+    var capturedText = "original"
+    var capturedSelectionRange = NSRange(location: 2, length: 0)
+    var capturedApplicationName: String? = "Mock"
+    var useApplicationContentAdapter = false
 
     func captureFocusedTextField() throws -> CapturedTextField {
-        CapturedTextField(
-            text: "original",
-            selectionRange: NSRange(location: 2, length: 0),
+        if useApplicationContentAdapter {
+            let adapter = AccessibilityTextContentAdapter.make(
+                accessibilityText: capturedText,
+                selectionRange: capturedSelectionRange,
+                applicationName: capturedApplicationName
+            )
+            return CapturedTextField(
+                contentAdapter: adapter,
+                target: target,
+                applicationName: capturedApplicationName
+            )
+        }
+        return CapturedTextField(
+            text: capturedText,
+            selectionRange: capturedSelectionRange,
             target: target,
-            applicationName: "Mock"
+            applicationName: capturedApplicationName
         )
     }
 
@@ -283,6 +421,10 @@ private final class MockFallbackWriter: ClipboardFallbackWriting {
     var calls = 0
     var lastText: String?
     var onSuccessfulReplace: ((String) -> Void)?
+    var rangeResult = true
+    var rangeCalls = 0
+    var lastRangeReplacements: [AccessibilityTextReplacement] = []
+    var onSuccessfulRangeReplace: (([AccessibilityTextReplacement]) -> Void)?
 
     func replace(
         text: String,
@@ -294,6 +436,18 @@ private final class MockFallbackWriter: ClipboardFallbackWriting {
         focusTarget()
         if result { onSuccessfulReplace?(text) }
         return result
+    }
+
+    func replaceRanges(
+        _ replacements: [AccessibilityTextReplacement],
+        target: AccessibilityTextTarget,
+        focusTarget: () -> Void
+    ) async -> Bool {
+        rangeCalls += 1
+        lastRangeReplacements = replacements
+        focusTarget()
+        if rangeResult { onSuccessfulRangeReplace?(replacements) }
+        return rangeResult
     }
 }
 

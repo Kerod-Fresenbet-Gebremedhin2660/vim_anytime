@@ -64,6 +64,38 @@ final class ClipboardServicesTests: XCTestCase {
         XCTAssertEqual(clipboard.readText(), "new yank")
     }
 
+    func testRangeFallbackUsesEachGapAndRestoresIntentionalClipboard() async {
+        let pasteboard = makePasteboard()
+        let clipboard = SystemClipboardService(pasteboard: pasteboard)
+        clipboard.writeTextIntentionally("intentional yank")
+        let observed = LockedStrings()
+        let fallback = ClipboardFallbackService(
+            clipboard: clipboard,
+            rangeReplacementAction: { replacement, _ in
+                observed.append("\(NSStringFromRange(replacement.range))=\(clipboard.readText() ?? "")")
+                return true
+            },
+            restorationDelayNanoseconds: 0
+        )
+        let replacements = [
+            AccessibilityTextReplacement(range: NSRange(location: 20, length: 4), text: "tail 😀"),
+            AccessibilityTextReplacement(range: NSRange(location: 0, length: 3), text: "head"),
+        ]
+
+        let result = await fallback.replaceRanges(
+            replacements,
+            target: AccessibilityTextTarget(testProcessIdentifier: 0),
+            focusTarget: {}
+        )
+
+        XCTAssertTrue(result)
+        XCTAssertEqual(
+            observed.values,
+            ["{20, 4}=tail 😀", "{0, 3}=head"]
+        )
+        XCTAssertEqual(clipboard.readText(), "intentional yank")
+    }
+
     private func makePasteboard() -> NSPasteboard {
         let name = NSPasteboard.Name("dev.vimany.tests.\(UUID().uuidString)")
         return NSPasteboard(name: name)
@@ -80,6 +112,19 @@ private final class LockedString: @unchecked Sendable {
     }
 }
 
+private final class LockedStrings: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [String] = []
+
+    var values: [String] {
+        lock.withLock { storage }
+    }
+
+    func append(_ value: String) {
+        lock.withLock { storage.append(value) }
+    }
+}
+
 private extension NSLock {
     func withLock<T>(_ body: () -> T) -> T {
         lock()
@@ -87,4 +132,3 @@ private extension NSLock {
         return body()
     }
 }
-
